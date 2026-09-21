@@ -50,9 +50,10 @@ def bootstrap_text(role, handoff, cli, doorbell):
         handle = (
             "   recover / design / task_created / worker_ready: assign waiting tasks when the Worker is ready:\n"
             f"     {cli} assign --task T\n"
-            "   result: the Worker finished task T and is idle. If the message has a `digest`, it holds automatic\n"
-            "     review results (e.g. Jev probabilities) that the harness already ran: use them to decide what to read.\n"
-            "     Decide:\n"
+            "   result: the Worker finished task T and is idle. Review the change yourself against the design\n"
+            "     (read the changed files) before deciding. If the message has a `digest` (automatic review results,\n"
+            "     e.g. Jev probabilities, already run by the harness), start with the spots it flags, but do not stop\n"
+            "     there: a digest can miss problems. Decide:\n"
             f"     {cli} accept --task T        (the controller verifies every check passed on the current files)\n"
             f"     {cli} correct --task T --instruction \"what to change\"\n"
             "   blocked / worker_idle / progress_review / task_deadline / session_exited: investigate with\n"

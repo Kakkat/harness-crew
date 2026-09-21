@@ -1,4 +1,4 @@
 [
   "codex",
-  "Read the role bootstrap file at {bootstrap} and follow its persistent mailbox protocol. Your workspace is {workspace}."
+  "Read the role bootstrap file at {bootstrap} and follow its protocol. Your workspace is {workspace}."
 ]

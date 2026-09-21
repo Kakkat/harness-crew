@@ -251,6 +251,7 @@ class TriageTests(unittest.TestCase):
         self.assertNotIn("CLI inbox --wait", worker)
         supervisor = bootstrap_text("supervisor", "/s/handoff.json", "CLI", doorbell=False)
         self.assertIn("CLI accept --task T", supervisor)
+        self.assertIn("Review the change yourself", supervisor)  # A digest guides the review; it never replaces it.
         self.assertIn("CLI inbox --wait", supervisor)
         self.assertNotIn("check --task", supervisor)
 

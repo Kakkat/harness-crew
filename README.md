@@ -90,23 +90,29 @@ Its loop is:
 
 ```text
 ready
-inbox --wait
+inbox                      # one message as JSON, or null
+  null -> end the turn and wait (no polling, no model calls)
 ack --message MESSAGE_ID
 perform role work
 ready
-inbox --wait
 ...
 ```
 
-`inbox --wait` is a blocking local poll; it makes no model calls. If a delivered message's reply is lost, `inbox` returns that unacknowledged message again, marked `redelivered`. A Worker performs `check --task TASK_ID --name CHECK_NAME`, fixes failures, and finally calls:
+**Doorbell.** In tmux/psmux the agent ends its turn while idle, so waiting costs no model calls. When a message is waiting and the agent has declared `ready`, the controller types one notice line into its terminal: `[triad] A new message is waiting. Receive it now with: … inbox`. It rings at most 3 times, 60 s apart, and **never while the agent is busy**, where typing could answer a prompt. Without a multiplexer, agents use `inbox --wait`, a local poll that also makes no model calls. Set `"doorbell": false` in `config.json` to restore polling.
+
+**Forgiving turn rules.** A `result` or `blocked` ends the Worker's turn, and so does calling `inbox` with nothing outstanding. An agent that forgets a separate `ready` cannot freeze the loop. If a delivered message's reply is lost, `inbox` returns that unacknowledged message again, marked `redelivered`.
+
+A Worker performs `check --task TASK_ID --name CHECK_NAME`, fixes failures, and finally calls:
 
 ```text
 result --task TASK_ID --summary "What changed" --evidence RUN_ID [RUN_ID ...]
 ```
 
-It may instead call `blocked --task TASK_ID --reason "Specific blocker"`. Supervisor uses `assign`, `correct`, `accept`, `replace`, and `escalate`. `--help` documents arguments.
+It may instead call `blocked --task TASK_ID --reason "Specific blocker"`. Supervisor uses `assign`, `correct`, `accept`, `replace`, and `escalate`. `--help` documents arguments. Each role's bootstrap spells out these exact commands.
 
-`ready` is an explicit promise that the preceding work is quiescent. This adapter trusts cooperative protocol behavior; it cannot prove an arbitrary terminal agent has stopped reasoning or launching undeclared commands. It does not screen-scrape prompts or equate silence with completion. No subsequent prompt is injected into a running terminal command: messages are retrieved by the agent itself.
+**When the Supervisor is woken.** It is woken only when it has a decision to make: at start (`recover`), for new work, when the Worker is ready and a task is waiting to be assigned, for a result, for a blocker, and for deadlines and session problems. A result arrives once the Worker is idle, so it can be accepted immediately. A Worker that sits ready on an unfinished task for 60 s is nudged by the controller with the exact `check`/`result` commands, up to twice, before the Supervisor is woken (`worker_idle`). The five-minute quiet warning fires only while the Worker is busy.
+
+`ready` is an explicit promise that the preceding work is quiescent. This adapter trusts cooperative protocol behavior; it cannot prove an arbitrary terminal agent has stopped reasoning or launching undeclared commands. It does not screen-scrape prompts or equate silence with completion. The doorbell only types a fixed notice into an idle prompt; it never injects anything into a running command, and messages are still retrieved by the agent itself.
 
 ### Structured JSONL adapter
 
@@ -177,6 +183,10 @@ A check can ask [TypeSafe's Jev](https://docs.typesafe.ai/) one yes/no question 
 - A gate adds to tests; it never replaces them. The judged material is sent to TypeSafe, so don't gate content you can't share. Input is limited to 200,000 characters.
 
 See `examples/jev-gated-task.json`.
+
+**Advisory review with a digest.** A check marked `"advisory": true` runs through the normal check runner and must finish on unchanged files, but its verdict never blocks acceptance. `triad review PATHS` is built for this: it asks Jev a narrow 8-question checklist per function (injection, swallowed errors, leaks, unbounded loops, destructive actions, boundaries, exception types, name/behavior mismatch) and prints the stand-out flags. When a result reaches the Supervisor, each advisory check's output travels with it as `digest`, so the Supervisor gets the probabilities without spending turns producing them. By default the Supervisor still reviews the change itself and starts with the flagged spots, because a digest can miss problems. See `examples/jev-reviewed-task.json`.
+
+In an A/B run on the calculator example, a digest-only Supervisor was the cheapest and fastest, but accepted code with robustness bugs. The Supervisor that read the code caught them. See VALIDATION.md.
 
 ## Storage and token limits
 

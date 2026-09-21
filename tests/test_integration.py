@@ -13,6 +13,11 @@ from triad.client import Client
 from triad.core import initialize
 from triad.util import TriadError, atomic_json, read_json
 
+# Tests use their own controllers. A session credential inherited from an enclosing Triad
+# session (for example when a Worker runs this suite) must not leak into test clients.
+for _name in [n for n in os.environ if n.startswith("TRIAD_")]:
+    del os.environ[_name]
+
 # Orphans a sleeper in its own session, as a daemonizing tool would, then acts as a Worker.
 ESCAPING_HARNESS = r'''
 import json, os, subprocess, sys, time
@@ -55,7 +60,9 @@ for line in sys.stdin:
 '''
 
 
-class IntegrationTests(unittest.TestCase):
+class ControllerFixture(unittest.TestCase):
+    """Isolated state, workspace and controller; no tests of its own."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -70,6 +77,8 @@ class IntegrationTests(unittest.TestCase):
     def launch_controller(self):
         self.proc = subprocess.Popen([sys.executable, str(ENTRY), "--state", str(self.state), "serve"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Runs even if setUp fails, so a controller is never left behind.
+        self.addCleanup(lambda proc=self.proc: proc.poll() is None and (proc.kill(), proc.wait(timeout=5)))
         self.wait(lambda: self.client.call("status"), timeout=10)
 
     def wait(self, predicate, timeout=15):
@@ -122,6 +131,8 @@ class IntegrationTests(unittest.TestCase):
                 self.proc.wait(timeout=5)
             self.temp.cleanup()
 
+
+class IntegrationTests(ControllerFixture):
     def test_complete_two_tasks_in_same_persistent_sessions(self):
         self.start("worker")
         self.start("supervisor")

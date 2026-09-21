@@ -11,7 +11,7 @@ Designer (design contract / CLI)
 
 The controller has no model and makes no design decisions. Harnesses are external commands behind a protocol adapter; processes live behind a separate session backend. No AI provider, account, SDK, browser, or third-party Python package is required by the controller.
 
-Requires Python 3.11+. Run from this directory with `python -m triad`, or use the absolute `triad_entry.py` path from any directory. Installing the package is optional.
+Requires Python 3.11+. Run from this directory with `python -m triad`, or use the absolute `triad_entry.py` path from any directory. Installing the package is optional; an installed wheel includes `triad_entry.py`, which sessions, checks and the SSH runtime bundle launch by absolute path.
 
 For a Supervisor and Worker on different PCs, see [SSH host setup](SSH.md). Host connections, multiplexers, and harness profiles are separate choices.
 
@@ -134,12 +134,14 @@ The harness explicitly acknowledges each message, uses role-authorized actions, 
 - SQLite atomically records task changes and outgoing messages. The controller is its only writer.
 - Requests carry idempotency IDs. An identical retry returns the saved result; changed content under the same ID is rejected.
 - Submitted messages are not blindly replayed. If a client loses a reply, retry the same request ID. A crashed host with uncertain prompt delivery requires replacement/reconciliation.
-- Startup reserves a deterministic generation before spawning. Each host records its process identity, then confirms its credential with the controller before spawning its harness. If a start fails, run `start` again: the controller first confirms the failed generation has stopped. A host that never recorded an identity never spawned anything. A backend missing on the selected host is rejected before a generation is reserved.
+- Startup reserves a deterministic generation before spawning. Each host records its process identity, then waits for the controller to confirm its credential before spawning its harness. A host that cannot reach the controller does not assume authorization: it waits (stoppable through its recorded identity) and exits unspawned after 10 minutes. An already authorized, running harness keeps working through a controller outage. If a start fails, run `start` again: the controller first confirms the failed generation has stopped. A host that never recorded an identity never spawned anything. A backend missing on the selected host is rejected before a generation is reserved.
 - Every session has a generation-scoped credential. Replaced Workers cannot submit valid late results.
 - Windows hosts use a Job Object; POSIX hosts use a process group. On Linux the host is also a child subreaper, so orphaned descendants, including ones that call `setsid()`, stay in its tree and are stopped with the session. Processes started through another service manager (for example `systemd-run` or a remote daemon) are not contained.
 - A workspace lock plus durable owner reference prevents a second state directory from taking over a workspace with unreconciled sessions.
+- Each check runs under its own containment runner (a Linux child subreaper, a process group elsewhere on POSIX, a Windows Job Object). The run completes only when every descendant has exited, including ones that redirected their output or called `setsid()`. On timeout the runner's whole tree is killed. If containment cannot be confirmed, the run is recorded `unknown`, which blocks `ready`, results and acceptance until the Worker is stopped. On macOS/BSD, a descendant that leaves the check's process group is not observed.
+- `stop` attempts every owned session even when the database cannot record it. Ordinary writes stop 1 MiB below the 16 MiB SQLite cap, so stop, shutdown and deadline records normally still fit. If a write fails anyway, the sessions are still stopped. The error is returned and kept in `reconcile.json` (shown by `status`). Run `stop` again once storage is available: it records the stop, logs a `reconciled` event, and removes the file. `shutdown` is allowed once every session is stopped or was terminated by this controller.
 - A handoff stores design, tasks, checks, runs, and the current content fingerprint. Native model context is optional and not yet resumed automatically.
-- Task deadlines default to one hour; named check deadlines default to five minutes. A task deadline pauses the job and attempts to stop its Worker. A five-minute progress gap creates a review event, not a success/failure judgment.
+- Task deadlines default to one hour; named check deadlines default to five minutes. A task deadline pauses the job and attempts to stop its Worker, even if the deadline cannot be recorded. A five-minute progress gap creates a review event, not a success/failure judgment.
 
 No automatic implementation retry policy is hidden in the controller. Supervisor decides retry, correction, replacement, or escalation, within the task/run/session budgets.
 
@@ -167,7 +169,7 @@ Defaults:
 | Item | Limit |
 |---|---:|
 | Each captured stdout/stderr/session log | 1 MiB |
-| SQLite database | 16 MiB |
+| SQLite database | 16 MiB (last 1 MiB reserved for stop/shutdown/deadline) |
 | State-directory admission budget | 128 MiB |
 | Sessions/generations per job | 32 |
 | Verification runs per job | 64 |
@@ -186,7 +188,7 @@ These caps cover **Triad-owned files only**. AI harness history, model downloads
 python -m unittest discover -s tests -v
 ```
 
-The automated tests cover authorization, stale generations, request deduplication, ambiguous delivery, persistence, exclusive ownership, changed source evidence, running/failed checks, bounded logs, controller crash/reconnect, reusable sessions, takeover, Worker replacement, command timeouts, SSH host routing, pause authority, failed-start recovery, recycled PIDs, lost-reply redelivery, and (on Linux) descendants that leave the process group. They include switching a live job from a structured Worker to a cooperative Worker in the native multiplexer (psmux on Windows, tmux elsewhere) without changing Supervisor logic. The complete two-session demo has also been exercised against psmux.
+The automated tests cover authorization, stale generations, request deduplication, ambiguous delivery, persistence, exclusive ownership, changed source evidence, running/failed checks, bounded logs, controller crash/reconnect, reusable sessions, takeover, Worker replacement, command timeouts, SSH host routing, pause authority, failed-start recovery, recycled PIDs, lost-reply redelivery, and (on Linux) descendants that leave the process group. `tests/test_review_regressions.py` covers startup authorization during a controller outage, check descendants that redirect output, stop with a full database, and an installed wheel run from outside the checkout. They include switching a live job from a structured Worker to a cooperative Worker in the native multiplexer (psmux on Windows, tmux elsewhere) without changing Supervisor logic. The complete two-session demo has also been exercised against psmux.
 
 V1 has one controller / one job / one Worker, with independent local or SSH host selection for Supervisor and Worker. Linux process paths, the tmux backend, and SSH tunnels have been exercised live on Linux, with SSH over loopback (see VALIDATION.md); tsmux and SSH between separate machines still need live acceptance testing. Multiple Workers, automatic Git integration or repository migration, adversarial sandboxing, native provider context resume, and provider billing telemetry are intentionally not claimed.
 

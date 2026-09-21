@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from .backends import kill_posix_tree, process_identity
+from .backends import kill_posix_group, kill_posix_tree, process_identity
 from .adapters import adapter
 from .client import Client
 from .util import CappedLog, FileLock, TriadError, atomic_json, now, read_json, uid
@@ -77,6 +77,24 @@ def reap_adopted(harness_pid):
         os.waitpid(info.si_pid, 0)
 
 
+def authorize_startup(client, timeout):
+    """Startup handshake. Spawn nothing without an affirmative reply from the controller.
+
+    A session revoked before this host recorded its identity was stopped without a signal,
+    and only the controller knows that. During an outage this host waits (it is already
+    recorded, so a stop still finds it); it never assumes it is authorized."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return client.call("heartbeat")
+        except TriadError as exc:
+            if not str(exc).startswith("Controller unavailable"):
+                raise
+            if time.monotonic() >= deadline:
+                raise TriadError(f"No startup authorization within {timeout} seconds; harness not started") from exc
+        time.sleep(0.5)
+
+
 def host(spec_path):
     spec_path = Path(spec_path).resolve()
     spec = read_json(spec_path)
@@ -99,13 +117,7 @@ def host(spec_path):
             writer_lock = FileLock(workspace.parent / (".triad-writer-" + suffix + ".lock")).acquire()
         atomic_json(root / "host.json", metadata)
         client = Client(spec["state_dir"], spec["token"])
-        # Startup handshake. A session revoked before this host recorded its identity was
-        # stopped without a signal, so this host must not spawn its harness now.
-        try:
-            client.call("heartbeat", retries=2)
-        except TriadError as exc:
-            if not str(exc).startswith("Controller unavailable"):
-                raise
+        authorize_startup(client, spec.get("startup_timeout", 600))
         env = os.environ.copy()
         env.update(TRIAD_STATE=spec["state_dir"], TRIAD_TOKEN=spec["token"],
                    TRIAD_ROLE=spec["role"], TRIAD_GENERATION=str(spec["generation"]),
@@ -225,19 +237,76 @@ def host(spec_path):
         # Windows closes the job handle on process exit, killing all remaining descendants.
 
 
+def job_active_processes(handle):
+    """Number of live processes in a Windows Job Object."""
+    from ctypes import wintypes
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.DWORD, ctypes.c_void_p]
+    info = Accounting()
+    if not kernel.QueryInformationJobObject(handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+        raise TriadError(f"Cannot inspect check containment: {ctypes.get_last_error()}")
+    return info.ActiveProcesses
+
+
+def contain_check(status_path, argv):
+    """Run one check inside its own containment boundary and exit only once it is empty.
+
+    Output pipes say nothing about descendants that redirected their output, so quiescence
+    is observed directly: on Linux this runner is the child subreaper of everything the
+    check starts (including setsid/double-fork orphans) and waits until it has no children;
+    other POSIX systems watch the check's process group; Windows watches its Job Object."""
+    handle = contain_host()
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"Cannot start check: {exc}", file=sys.stderr, flush=True)
+        atomic_json(Path(status_path), {"exit_code": -1, "quiescent": True})
+        return 1
+    code = proc.wait()
+    if sys.platform.startswith("linux"):
+        while True:
+            try:
+                os.wait()  # Blocks until an adopted descendant exits.
+            except ChildProcessError:
+                break
+    elif os.name == "nt":
+        while job_active_processes(handle) > 1:  # This runner is the remaining member.
+            time.sleep(0.1)
+    else:
+        from .backends import posix_processes
+        group, me = os.getpgrp(), str(os.getpid())
+        while any(row[0] != me and int(row[1]) == group and not row[2].startswith("Z")
+                  for row in posix_processes("pid=,pgid=,stat=")):
+            time.sleep(0.1)
+    atomic_json(Path(status_path), {"exit_code": code, "quiescent": True})
+    return 0
+
+
 def run_check(client, task_id, name):
     run = client.call("run_start", {"task": task_id, "check": name}, retries=3)
     root = client.root / "evidence" / run["id"]
     root.mkdir(parents=True, exist_ok=True)
     logs = [CappedLog(root / "stdout.log", run["log_bytes"]),
             CappedLog(root / "stderr.log", run["log_bytes"])]
+    status_path = root / "containment.json"
     timed_out = False
     quiescent = True
     proc = None
     try:
-        proc = subprocess.Popen(run["argv"], cwd=run["cwd"], stdin=subprocess.DEVNULL,
+        from .backends import ENTRY
+        # The runner, not the check, is the observed process: it outlives every descendant.
+        proc = subprocess.Popen([sys.executable, "-B", str(ENTRY), "contain-check", "--status", str(status_path),
+                                 "--", *run["argv"]], cwd=run["cwd"], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=False)
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
         def drain(stream, log):
             while chunk := stream.read(8192):
@@ -252,10 +321,28 @@ def run_check(client, task_id, name):
         except subprocess.TimeoutExpired:
             timed_out = True
             if os.name == "nt":
+                # Killing the runner closes the check's job handle, which kills every member.
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10)
             else:
-                kill_posix_tree(proc.pid)
+                try:
+                    kill_posix_group(proc.pid, 10, kill_posix_tree(proc.pid))
+                except TriadError as exc:
+                    logs[1].write(f"\n{exc}\n")
+                    quiescent = False
             code = proc.wait(timeout=10)
+        else:
+            status = read_json(status_path) if status_path.exists() else None
+            if status and status.get("quiescent"):
+                code = status["exit_code"]
+            else:
+                # The runner died before observing an empty boundary: survivors are unknown.
+                logs[1].write("\n[TRIAD: check containment ended before its descendants were confirmed stopped]\n")
+                code, quiescent = -1, False
+                if os.name != "nt":
+                    try:
+                        kill_posix_group(proc.pid, 10)
+                    except TriadError:
+                        pass
         for thread in threads:
             thread.join(timeout=2)
         if any(t.is_alive() for t in threads):

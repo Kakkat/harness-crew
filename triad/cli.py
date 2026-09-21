@@ -77,6 +77,9 @@ def parser():
     escalation.add_argument("--recommendation", required=True)
     host = sub.add_parser("host", help=argparse.SUPPRESS)
     host.add_argument("--spec", required=True)
+    contained = sub.add_parser("contain-check", help=argparse.SUPPRESS)
+    contained.add_argument("--status", required=True)
+    contained.add_argument("argv", nargs=argparse.REMAINDER)
     sub.add_parser("remote-rpc", help="Internal SSH helper")
     probe = sub.add_parser("host-check", help="Check SSH, Python and multiplexer without starting an AI session")
     probe.add_argument("--hosts-file", required=True)
@@ -165,6 +168,10 @@ def main(argv=None):
             from .runtime import host
             host(args.spec)
             return
+        elif command == "contain-check":
+            from .runtime import contain_check
+            argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+            raise SystemExit(contain_check(args.status, argv))
         elif command == "remote-rpc":
             from .remote import main as remote_main
             remote_main()

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
 
 from .util import now, uid
+
+LIMIT_BYTES = 16 * 1024 * 1024
+RESERVE_BYTES = 1024 * 1024
 
 
 class Store:
@@ -15,9 +19,13 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA synchronous=FULL")
-        # 16 MiB with SQLite's default 4096-byte pages; fail instead of unbounded growth.
+        # 16 MiB hard limit; fail instead of unbounded growth. Ordinary writes stop 1 MiB
+        # earlier so that stop, shutdown and deadline records still fit (see reserve()).
         page_size = self.db.execute("PRAGMA page_size").fetchone()[0]
-        self.db.execute(f"PRAGMA max_page_count={16 * 1024 * 1024 // page_size}")
+        self.hard_pages = LIMIT_BYTES // page_size
+        self.normal_pages = (LIMIT_BYTES - RESERVE_BYTES) // page_size
+        self.reserved = 0
+        self.db.execute(f"PRAGMA max_page_count={self.normal_pages}")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS sessions(
@@ -34,6 +42,19 @@ class Store:
             id TEXT PRIMARY KEY, identity TEXT NOT NULL, action TEXT NOT NULL,
             body TEXT NOT NULL, result TEXT NOT NULL);
         """)
+
+    @contextmanager
+    def reserve(self):
+        """Allow control records to use the capacity held back from ordinary writes."""
+        self.reserved += 1
+        self.db.execute(f"PRAGMA max_page_count={self.hard_pages}")
+        try:
+            yield
+        finally:
+            self.reserved -= 1
+            if not self.reserved:
+                # SQLite keeps the current size if it already exceeds the ordinary limit.
+                self.db.execute(f"PRAGMA max_page_count={self.normal_pages}")
 
     def meta(self, key, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import secrets
+import sqlite3
 import sys
 
 from .backends import BACKENDS, ENTRY, alive, backend
@@ -17,6 +19,8 @@ READS = {"status", "events", "task", "observe", "storage", "evidence"}
 SESSION_ACTIONS = {"inbox", "ack", "ready", "heartbeat", "progress"}
 # Pauses that only the Designer may lift. The Supervisor may resume its own and deadline pauses.
 DESIGNER_PAUSES = {"designer", "escalation", "takeover"}
+# Idempotent emergency controls: they may use reserved storage and keep no request receipt.
+CONTROLS = {"stop", "shutdown"}
 
 
 def initialize(root, workspace, backend_name="local", hosts=None, workspace_host="local"):
@@ -67,6 +71,8 @@ class Core:
         self.store = Store(self.root)
         self.connections = Connections(self.root, self.config)
         self.next_host_probe = {}
+        self.terminated = set()  # (role, generation) confirmed stopped by this controller
+        self.shutdown_requested = False
 
     def identity(self, token):
         if secrets.compare_digest(token, self.config["admin_token"]):
@@ -101,8 +107,8 @@ class Core:
         identity = f"{who[0]}:{who[1]}"
         body = json.dumps(data, sort_keys=True)
         # Polling and heartbeats are observations: never accumulate millions of receipts.
-        cache = action not in READS | {"heartbeat"}
-        with self.store.db:
+        cache = action not in READS | {"heartbeat"} | CONTROLS
+        with self.store.reserve() if action in CONTROLS else nullcontext(), self.store.db:
             previous = self.store.db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
             if previous:
                 if (previous["identity"], previous["action"], previous["body"]) != (identity, action, body):
@@ -151,7 +157,8 @@ class Core:
         return {"job": self.store.meta("job"), "sessions": sessions,
                 "tasks": self.store.all("tasks"), "runs": self.store.all("runs"),
                 "workspace": {"host": self.config.get("workspace_host", "local"), "path": self.config["workspace"]},
-                "connection_errors": dict(self.connections.last_error)}
+                "connection_errors": dict(self.connections.last_error),
+                "reconcile": read_json(self.root / "reconcile.json") if (self.root / "reconcile.json").exists() else None}
 
     def do_events(self, who, data):
         return self.store.events(int(data.get("after", 0)))
@@ -520,7 +527,36 @@ class Core:
         session = self.session(role)
         if session["state"] == "stopped":
             return session
-        self.connections.for_session(session).session("stop", session)
+        self.terminate(session)
+        return self.record_stopped(session)
+
+    def terminate(self, session):
+        """Stop a session's processes. Uses only its spec and host identity, never new writes."""
+        key = (session["role"], session["generation"])
+        if key not in self.terminated:
+            self.connections.for_session(session).session("stop", session)
+            self.terminated.add(key)
+
+    def persist(self, errors, label, action):
+        """Record control state using reserved capacity. A storage failure is kept, not raised."""
+        try:
+            with self.store.reserve():
+                action()
+                self.store.db.commit()
+        except sqlite3.Error as exc:
+            self.store.db.rollback()
+            errors.append(f"{label} not recorded: {exc}")
+
+    def record_reconcile(self, errors):
+        record = {"time": now(), "errors": errors,
+                  "terminated": [f"{role}-g{generation}" for role, generation in sorted(self.terminated)]}
+        try:
+            atomic_json(self.root / "reconcile.json", record)
+        except OSError:
+            pass  # The error is still reported to the caller.
+
+    def record_stopped(self, session):
+        role = session["role"]
         session.update(state="stopped", turn="ended")
         self.store.put("sessions", session)
         self.store.db.execute("UPDATE messages SET state='abandoned' WHERE recipient=? AND generation=? AND state IN ('queued','submitted')",
@@ -615,23 +651,50 @@ class Core:
             "directory": directory, "file": data.get("file", "stdout.log"), "bytes": data.get("bytes", 16384)})}
 
     def do_stop(self, who, data):
-        self.do_pause(who, {})
-        self.store.db.commit()
+        # Emergency path: every owned session is stopped even when the database cannot record
+        # it. Failures are collected, reported, and kept in reconcile.json for a later stop.
+        errors = []
+        self.persist(errors, "pause", lambda: self.do_pause(who, {}))
         for role in ["worker", "supervisor"]:
-            if self.store.get("sessions", role):
-                self.stop_role(role)
-                self.store.db.commit()
-        job = self.store.meta("job")
-        job["state"] = "stopped"
-        self.store.set_meta("job", job)
-        self.store.event("stopped", {})
-        return job
+            session = self.store.get("sessions", role)
+            if not session or session["state"] == "stopped":
+                continue
+            try:
+                self.terminate(session)
+            except Exception as exc:
+                errors.append(f"{role} stop unconfirmed: {exc}")
+                continue
+            self.persist(errors, f"{role} stop", lambda: self.record_stopped(session))
+        if errors:
+            self.record_reconcile(errors)
+            raise TriadError("Stop incomplete; " + "; ".join(errors) +
+                             ". Terminated sessions stay stopped; resolve the cause and run stop again to reconcile")
+        reconcile = self.root / "reconcile.json"
+
+        def finish():
+            job = self.store.meta("job")
+            job["state"] = "stopped"
+            self.store.set_meta("job", job)
+            if reconcile.exists():
+                self.store.event("reconciled", read_json(reconcile))
+            self.store.event("stopped", {})
+        self.persist(errors, "job stop", finish)
+        if errors:
+            self.record_reconcile(errors)
+            raise TriadError(f"All sessions stopped; {errors[0]}. Run stop again once storage is available")
+        reconcile.unlink(missing_ok=True)
+        return self.store.meta("job")
 
     def do_shutdown(self, who, data):
-        if self.store.meta("job")["state"] != "stopped":
+        stopped = all(s["state"] == "stopped" or (s["role"], s["generation"]) in self.terminated
+                      for s in self.store.all("sessions"))
+        if self.store.meta("job")["state"] != "stopped" and not stopped:
             raise TriadError("Stop owned sessions before shutting down the controller")
-        self.store.set_meta("shutdown", True)
-        return {"shutdown": True}
+        # Also held in memory: a full database must not keep the controller running.
+        self.shutdown_requested = True
+        errors = []
+        self.persist(errors, "shutdown", lambda: self.store.set_meta("shutdown", True))
+        return {"shutdown": True, **({"errors": errors} if errors else {})}
 
     def tick(self):
         self.connections.tick(self.store.all("sessions"))
@@ -641,15 +704,27 @@ class Core:
                     continue
                 age = now() - task["assigned_at"]
                 if age > task["timeout"] and not task.get("deadline_reported"):
-                    task["deadline_reported"] = True
-                    self.store.put("tasks", task)
-                    self.notify("task_deadline", {"task": task["id"], "timeout": task["timeout"]})
-                    self.do_pause(("designer", 0), {}, reason="deadline")
+                    self.store.db.commit()
+                    errors = []
+
+                    def report():
+                        task["deadline_reported"] = True
+                        self.store.put("tasks", task)
+                        self.notify("task_deadline", {"task": task["id"], "timeout": task["timeout"]})
+                        self.do_pause(("designer", 0), {}, reason="deadline")
+                    self.persist(errors, "deadline", report)
                     # Deadline enforcement is deterministic policy, not a new reasoning role.
+                    # The Worker is stopped even when the deadline could not be recorded.
+                    worker = self.session("worker")
                     try:
-                        self.stop_role("worker")
+                        if worker["state"] != "stopped":
+                            self.terminate(worker)
+                            self.persist(errors, "worker stop", lambda: self.record_stopped(worker))
                     except TriadError as exc:
-                        self.store.event("stop_unconfirmed", {"error": str(exc)})
+                        self.persist(errors, "stop_unconfirmed", lambda: self.store.event("stop_unconfirmed", {"error": str(exc)}))
+                    if errors:
+                        self.record_reconcile(errors)
+                        raise TriadError("Deadline enforcement not fully recorded: " + "; ".join(errors))
                 elif now() - task.get("progress_at", task["assigned_at"]) > 300 and not task.get("stall_reported"):
                     task["stall_reported"] = True
                     self.store.put("tasks", task)

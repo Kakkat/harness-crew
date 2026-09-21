@@ -12,5 +12,9 @@ dependencies = []
 [project.scripts]
 triad = "triad.cli:main"
 
+[tool.setuptools]
+# Sessions, checks and the SSH runtime bundle launch this file by absolute path.
+py-modules = ["triad_entry"]
+
 [tool.setuptools.packages.find]
 include = ["triad*"]

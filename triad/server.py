@@ -50,7 +50,7 @@ def serve(root, port=0):
                             f"Workspace has an unreconciled owner in another state directory ({previous_root}). "
                             f"Stop its sessions there; if that state is gone and nothing runs, delete {ownership}")
             atomic_json(ownership, {"state": str(root)})
-            with core.store.db:
+            with core.store.reserve(), core.store.db:
                 core.store.set_meta("shutdown", False)
             class Handler(BaseHTTPRequestHandler):
                 def log_message(self, *args):
@@ -96,7 +96,7 @@ def serve(root, port=0):
             try:
                 while True:
                     server.handle_request()
-                    if core.store.meta("shutdown", False):
+                    if core.shutdown_requested or core.store.meta("shutdown", False):
                         break
                     if time.monotonic() - last_tick > 2:
                         tick_error = tick_safely(core, tick_error)

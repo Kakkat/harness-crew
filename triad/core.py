@@ -50,7 +50,9 @@ def bootstrap_text(role, handoff, cli, doorbell):
         handle = (
             "   recover / design / task_created / worker_ready: assign waiting tasks when the Worker is ready:\n"
             f"     {cli} assign --task T\n"
-            "   result: the Worker finished task T and is idle. Decide:\n"
+            "   result: the Worker finished task T and is idle. If the message has a `digest`, it holds automatic\n"
+            "     review results (e.g. Jev probabilities) that the harness already ran: use them to decide what to read.\n"
+            "     Decide:\n"
             f"     {cli} accept --task T        (the controller verifies every check passed on the current files)\n"
             f"     {cli} correct --task T --instruction \"what to change\"\n"
             "   blocked / worker_idle / progress_review / task_deadline / session_exited: investigate with\n"
@@ -211,10 +213,33 @@ class Core:
         self.store.event("worker_ready", {"generation": generation})
 
     def deliver_result(self, task, worker_ready=True):
-        """One Supervisor message per result, sent when the Worker is quiescent so it can be accepted at once."""
+        """One Supervisor message per result, sent when the Worker is quiescent so it can be accepted at once.
+
+        Output of advisory checks (for example a Jev review run by the harness) travels with it as a digest,
+        so the Supervisor gets the probabilities without spending turns producing them."""
         task["result_notified"] = True
         self.store.put("tasks", task)
-        return self.message_supervisor("result", {"task": task["id"], **task["result"], "worker_ready": worker_ready})
+        body = {"task": task["id"], **task["result"], "worker_ready": worker_ready}
+        digest = {}
+        for check in task["checks"]:
+            if not check.get("advisory"):
+                continue
+            runs = [r for r in self.store.all("runs") if (r["task"], r["attempt"], r["check"]) == (task["id"], task["attempt"], check["name"])]
+            if runs:
+                try:
+                    digest[check["name"]] = self.evidence_text(runs[-1])
+                except (TriadError, OSError) as exc:
+                    digest[check["name"]] = f"(digest unavailable: {exc})"
+        if digest:
+            body["digest"] = digest
+        return self.message_supervisor("result", body)
+
+    def evidence_text(self, run, file="stdout.log", limit=4000):
+        connection = self.connections.get(run.get("host", "local"))
+        base = run.get("evidence_root", str(self.root))
+        directory = (str(PurePosixPath(base) / "evidence" / run["id"]) if connection.kind == "ssh"
+                     else str(Path(base) / "evidence" / run["id"]))
+        return connection.call("evidence", {"directory": directory, "file": file, "bytes": limit})
 
     def nudge_text(self, worker, task):
         cli = self.cli_for(worker)
@@ -347,6 +372,8 @@ class Core:
             timeout = check.get("timeout", 300)
             if not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400:
                 raise TriadError("Check timeout must be between 0 and 86400 seconds")
+            if not isinstance(check.get("advisory", False), bool):
+                raise TriadError("Check advisory flag must be true or false")
             names.add(name)
         task = {"id": uid("task"), "revision": 1, "objective": data["objective"],
                 "constraints": data.get("constraints", []), "checks": data["checks"],
@@ -496,10 +523,6 @@ class Core:
         job = self.store.meta("job")
         if job["state"] == "stopped":
             return None
-        if session["turn"] != "ready" and not data.get("redeliver") and self.become_ready(who, strict=False):
-            # Asking for the next message with nothing outstanding means the agent is free: an agent that
-            # forgets the separate `ready` must not freeze the loop (it would never be rung).
-            session = self.session(who[0])
         if data.get("redeliver"):
             # A reply lost after submission stays recoverable: this is not a new dispatch.
             row = self.store.db.execute(
@@ -507,6 +530,10 @@ class Core:
                 who).fetchone()
             if row:
                 return json.loads(row["data"]) | {"redelivered": True}
+        if session["turn"] != "ready" and self.become_ready(who, strict=False):
+            # Asking for the next message with nothing outstanding means the agent is free: an agent that
+            # forgets the separate `ready` must not freeze the loop (it would never be rung).
+            session = self.session(who[0])
         if ((who[0] == "worker" and job["state"] != "running")
                 or job.get("takeover") == who[0] or session["turn"] != "ready"):
             return None
@@ -614,7 +641,7 @@ class Core:
                 raise TriadError("Remote evidence storage budget reached")
         run = {"id": uid("run"), "task": task["id"], "attempt": task["attempt"], "generation": who[1],
                "host": connection.name, "evidence_root": connection.job_root(),
-               "check": check["name"], "timeout": check.get("timeout", 300),
+               "check": check["name"], "timeout": check.get("timeout", 300), "advisory": bool(check.get("advisory")),
                # {python} and {entry} resolve on the Worker's host, so checks can call this harness's CLI (e.g. `gate`).
                "argv": [a.replace("{python}", connection.python).replace("{entry}", connection.entry) for a in check["argv"]],
                "cwd": self.config["workspace"], "before": self.snapshot(), "state": "running", "started": now()}
@@ -631,7 +658,10 @@ class Core:
             raise TriadError("Run requires an integer exit code")
         run.update(state="finished" if data.get("quiescent", True) else "unknown", finished=now(), exit_code=code, timed_out=bool(data.get("timed_out")),
                    after=self.snapshot(), truncated=bool(data.get("truncated")))
-        run["valid"] = run["state"] == "finished" and code == 0 and not run["timed_out"] and run["before"] == run["after"]
+        # An advisory check (e.g. a Jev review) informs the Supervisor; its verdict never blocks acceptance,
+        # but it must still have run to completion on unchanged files.
+        run["valid"] = (run["state"] == "finished" and (code == 0 or run.get("advisory", False))
+                        and not run["timed_out"] and run["before"] == run["after"])
         self.store.put("runs", run)
         self.store.event("run_finished", run)
         return run

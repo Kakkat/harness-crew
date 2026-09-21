@@ -19,6 +19,7 @@ class FakeTypeSafe:
 
     def __init__(self):
         self.requests, self.status, self.reply = [], 200, {"model": "jev-test", "answers": {"gate": {"type": "noul", "noul": 0.1}}}
+        self.responder = None  # Optional: body -> reply, for multi-question requests.
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -28,7 +29,8 @@ class FakeTypeSafe:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fake.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
-                payload = json.dumps(fake.reply).encode() if isinstance(fake.reply, dict) else fake.reply
+                reply = fake.responder(body) if fake.responder else fake.reply
+                payload = json.dumps(reply).encode() if isinstance(reply, dict) else reply
                 self.send_response(fake.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -131,6 +133,43 @@ class GateTests(unittest.TestCase):
         self.assertIn("gate FAIL: P(yes)=97.0%", failed.stdout)
         self.fake.reply = {"error": "down"}
         self.assertEqual(run(status=503).returncode, 2)  # Errors fail the check too.
+
+
+class ReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeTypeSafe()
+        # Jev stand-in: only code that calls eval() looks like injection; everything else scores low.
+        self.fake.responder = lambda body: {"model": "jev-test", "answers": {
+            name: {"type": "noul", "noul": 0.95 if name == "injection" and "eval(" in body["state"]["code"] else 0.05}
+            for name in body["questions"]}}
+        self.env = patch.dict(os.environ, {"TYPESAFE_BASE_URL": self.fake.url, "TYPESAFE_API_KEY": "test-key"})
+        self.env.start()
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        (self.root / "calc.py").write_text("def safe(x):\n    y = x + 1\n    return y\n\n"
+                                           "def risky(text):\n    value = eval(text)\n    return value\n")
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "hook.sample").write_text("eval(dangerous)\n" * 3)  # Must be skipped.
+
+    def tearDown(self):
+        self.env.stop()
+        self.fake.close()
+        self.temp.cleanup()
+
+    def test_review_flags_only_the_standout_function(self):
+        from triad.review import digest, review
+        scored, flags = review([self.root], "test-key")
+        self.assertEqual(sorted(u["name"] for u in scored), ["risky", "safe"])  # .git skipped.
+        self.assertEqual([(q, u["name"]) for _, q, u in flags], [("injection", "risky")])
+        self.assertEqual(len(self.fake.requests), 2)  # One request per function, all questions together.
+        self.assertIn("injection", digest(scored, flags))
+
+    def test_cli_prints_digest(self):
+        result = subprocess.run([sys.executable, str(ENTRY), "review", str(self.root)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("2 pieces x 8 questions; 1 flag(s)", result.stdout)
+        self.assertRegex(result.stdout, r"95%\s+injection\s+\S+calc.py:5\s+risky")
 
 
 if __name__ == "__main__":

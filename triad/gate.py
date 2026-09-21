@@ -57,14 +57,14 @@ def git_diff(base):
     return "".join(parts)
 
 
-def ask(question, material, key, model=None, timeout=30):
-    """Return Jev's probability that the answer to a yes/no question is yes."""
+def ask_many(questions, state, key, model=None, timeout=30):
+    """Ask several yes/no questions about one state; return ({name: P(yes)}, model)."""
     base = os.environ.get("TYPESAFE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-    body = json.dumps({"state": {"material": material}, "model": model or os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL),
-                       "questions": {"gate": {"type": "noul", "instructions": question}}}).encode()
+    body = json.dumps({"state": state, "model": model or os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL),
+                       "questions": {name: {"type": "noul", "instructions": text} for name, text in questions.items()}}).encode()
     request = urllib.request.Request(base + "/v1/systemone", data=body, method="POST", headers={
         "Authorization": "Bearer " + key, "Content-Type": "application/json", "Accept": "application/json",
-        "User-Agent": "harness-crew-gate"})
+        "User-Agent": "harness-crew"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             answer = json.load(response)
@@ -73,9 +73,15 @@ def ask(question, material, key, model=None, timeout=30):
     except (OSError, ValueError) as exc:
         raise TriadError(f"Jev request failed: {exc}") from exc
     try:
-        return float(answer["answers"]["gate"]["noul"]), answer.get("model", "?")
+        return {name: float(answer["answers"][name]["noul"]) for name in questions}, answer.get("model", "?")
     except (KeyError, TypeError, ValueError):
         raise TriadError(f"Unexpected Jev response: {json.dumps(answer)[:200]}") from None
+
+
+def ask(question, material, key, model=None, timeout=30):
+    """Return Jev's probability that the answer to a yes/no question is yes."""
+    scores, used = ask_many({"gate": question}, {"material": material}, key, model, timeout)
+    return scores["gate"], used
 
 
 def gate(question, expect, minimum, material, key, model=None):

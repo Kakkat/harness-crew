@@ -87,6 +87,12 @@ def parser():
     material.add_argument("--text", help="Judge this text (default: stdin)")
     gate.add_argument("--model", help="Jev model (default jev-latest)")
     gate.add_argument("--key-file", help="File with the TypeSafe API key (default ~/.config/typesafe/api_key)")
+    audit = sub.add_parser("review", help="Advisory check: first-pass Jev review; prints the functions that stand out")
+    audit.add_argument("paths", nargs="+", help="Files or folders (Python split by function)")
+    audit.add_argument("--context", help="One-paragraph project description, to reduce false alarms")
+    audit.add_argument("--min", type=float, default=0.7, help="Lowest probability that can be flagged (default 0.7)")
+    audit.add_argument("--model", help="Jev model (default jev-latest)")
+    audit.add_argument("--key-file", help="File with the TypeSafe API key (default ~/.config/typesafe/api_key)")
     contained = sub.add_parser("contain-check", help=argparse.SUPPRESS)
     contained.add_argument("--status", required=True)
     contained.add_argument("argv", nargs=argparse.REMAINDER)
@@ -186,6 +192,12 @@ def main(argv=None):
             print(f"gate {'PASS' if passed else 'FAIL'}: P(yes)={p_yes:.1%}, expected {args.expect} "
                   f"with at least {args.min:.0%} confidence ({model})")
             raise SystemExit(0 if passed else 1)
+        elif command == "review":
+            from .gate import api_key
+            from .review import digest, review
+            scored, flags = review(args.paths, api_key(args.key_file), args.context, args.model, args.min)
+            print(digest(scored, flags))
+            return
         elif command == "contain-check":
             from .runtime import contain_check
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv

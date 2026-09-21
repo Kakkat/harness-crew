@@ -193,9 +193,15 @@ class TriageTests(unittest.TestCase):
     def test_inbox_with_nothing_outstanding_counts_as_ready(self):
         self.age("sessions", "supervisor", turn="running")  # Acked everything, then forgot `ready`.
         self.task()
-        self.assertEqual(self.call("inbox", role="supervisor")["type"], "task_created")
+        cli = {"redeliver": True}  # Exactly what `triad inbox` sends.
+        first = self.call("inbox", cli, role="supervisor")
+        self.assertEqual(first["type"], "task_created")
         self.assertEqual(self.core.session("supervisor")["turn"], "running")  # Now holding a message.
-        self.assertIsNone(self.call("inbox", role="supervisor"))  # Unacknowledged: still not free.
+        again = self.call("inbox", cli, role="supervisor")  # Unacknowledged: redelivered, not skipped.
+        self.assertEqual((again["id"], again["redelivered"]), (first["id"], True))
+        self.call("ack", {"message": first["id"]}, role="supervisor")
+        self.assertIsNone(self.call("inbox", cli, role="supervisor"))
+        self.assertEqual(self.core.session("supervisor")["turn"], "ready")  # Free now, so it can be rung.
 
     def test_new_supervisor_learns_of_an_already_ready_worker(self):
         with self.core.store.db:
@@ -205,6 +211,37 @@ class TriageTests(unittest.TestCase):
         with patch.object(LocalConnection, "session", return_value={"started": True}):
             self.call("start", {"role": "supervisor", "profile": "demo-supervisor"})
         self.assertEqual(self.queued("supervisor"), ["recover", "worker_ready"])
+
+    def test_advisory_check_never_blocks_and_its_digest_reaches_the_supervisor(self):
+        task = self.call("create_task", {"objective": "Write a file", "checks": [
+            {"name": "unit", "argv": [sys.executable, "-c", "pass"]},
+            {"name": "jev-review", "argv": ["review"], "advisory": True}]})
+        self.drain("supervisor")
+        self.call("assign", {"task": task["id"]}, role="supervisor")
+        message = self.call("inbox", role="worker")
+        self.call("ack", {"message": message["id"]}, role="worker")
+        runs = {}
+        for name, code in [("unit", 0), ("jev-review", 2)]:  # The review errored (e.g. Jev unreachable).
+            run = self.call("run_start", {"task": task["id"], "check": name}, role="worker")
+            evidence = Path(run["evidence_root"]) / "evidence" / run["id"]
+            evidence.mkdir(parents=True)
+            (evidence / "stdout.log").write_text("Jev review: 4 pieces x 8 questions; 1 flag(s).\n  95%  injection  x.py:3  risky\n")
+            runs[name] = self.call("run_finish", {"run": run["id"], "exit_code": code}, role="worker")
+        self.assertTrue(runs["jev-review"]["valid"])  # Advisory: a failed verdict never blocks.
+        self.call("result", {"task": task["id"], "summary": "done", "evidence": [r["id"] for r in runs.values()]}, role="worker")
+        message = self.call("inbox", role="supervisor")
+        self.assertIn("95%  injection  x.py:3  risky", message["body"]["digest"]["jev-review"])
+        self.call("ack", {"message": message["id"]}, role="supervisor")
+        self.assertEqual(self.call("accept", {"task": task["id"]}, role="supervisor")["state"], "accepted")
+
+    def test_ordinary_check_with_nonzero_exit_is_not_valid(self):
+        task = self.task()
+        self.drain("supervisor")
+        self.call("assign", {"task": task["id"]}, role="supervisor")
+        message = self.call("inbox", role="worker")
+        self.call("ack", {"message": message["id"]}, role="worker")
+        run = self.call("run_start", {"task": task["id"], "check": "unit"}, role="worker")
+        self.assertFalse(self.call("run_finish", {"run": run["id"], "exit_code": 2}, role="worker")["valid"])
 
     def test_instructions_are_role_specific_with_exact_commands(self):
         worker = bootstrap_text("worker", "/s/handoff.json", "CLI", doorbell=True)

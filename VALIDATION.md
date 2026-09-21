@@ -62,3 +62,24 @@ No external packages, browser runtimes, model weights, or caches were downloaded
 - Live, with the real Jev (`jev-1.13.0`), in two harness jobs using the scripted demo agents and `examples/jev-gated-task.json` unchanged:
   - Clean change: `greeting` passed; the gate passed with `P(yes)=2.0%`; the task was **accepted**.
   - A change that adds `import requests` and a `requirements.txt`: `greeting` passed; the gate failed with `P(yes)=99.0%`; the task was **blocked** and could not be accepted.
+
+## Supervisor triage, doorbell and harness-run Jev review (2026-09-21)
+
+**Tests:** 92 passed on Linux. On Windows, 92 passed with 7 POSIX/tmux-only skips. Live checks: the doorbell typed its notice verbatim into a tmux pane and a psmux pane, including literal key names such as `Enter`, and submitted it.
+
+**Live runs.** The calculator example (`evaluate()` plus a CLI) was run with an interactive Haiku (max effort) Worker and an Opus (low effort) Supervisor in tmux, with no human intervention. There is one run per variant, so these results are indicative, not statistical. Quality means a hidden 10-point test set (Unicode digits, deep nesting, CLI tracebacks, plus the acceptance suite) that the agents never saw.
+
+| | Old harness | A: Supervisor reads code | B3: Supervisor reads only the Jev digest | **C: default (reads code, digest as hints)** |
+|---|---|---|---|---|
+| Minutes until both tasks accepted | ~16 (10-min stall) | 4.8 | 3.1 | 5.3 |
+| Supervisor wakes | 8 | 4 | 4 | 5 |
+| Model calls after completion | 10 (idle polling) | 0 | 0 | 0 |
+| Opus calls | 27 | 17 | 12 | 20 |
+| Opus cached input / output tokens | 1.38M / 4.3K | 0.80M / 4.0K | 0.53M / 1.6K | 1.01M / 4.5K |
+| Corrections | 1 (by hand) | 1 | 0 | 1 (four fixes) |
+| Hidden quality | 4/10 | 10/10 | 6/10 | 10/10 |
+
+Findings:
+- The harness changes (triage, doorbell, exact commands in the bootstraps) are the main gain: no stall, half the Supervisor wakes, zero idle model calls, and a 3–5× shorter run.
+- A digest-only Supervisor (B3) was the cheapest, but approved code with robustness bugs. Jev flags point at where to look; they are not a review.
+- Live runs exposed three defects that were fixed before this record. Two were deadlocks: an agent that forgot `ready` was never rung, and a Worker became ready before the Supervisor existed. The third was a review prompt that swept in `.git`. `result`, `blocked` and `inbox` now end a turn, and a new Supervisor is told about a ready Worker.

@@ -73,6 +73,29 @@ class Core:
         self.next_host_probe = {}
         self.terminated = set()  # (role, generation) confirmed stopped by this controller
         self.shutdown_requested = False
+        # Reconciliation fence: sessions ("role-gN") whose stop is not yet durably recorded, and
+        # "job" while a requested stop is unrecorded. Kept in reconcile.json so it survives a
+        # controller restart; while nonempty, fenced credentials and new dispatch are refused.
+        self.fence = self.load_fence()
+
+    def load_fence(self):
+        path = self.root / "reconcile.json"
+        if not path.exists():
+            return set()
+        try:
+            fenced = read_json(path).get("fenced")
+        except (OSError, ValueError, AttributeError):
+            fenced = None
+        # An unreadable or older record names no sessions: fence all of them.
+        return set(fenced) | {"job"} if isinstance(fenced, list) else {"*", "job"}
+
+    def fenced(self, role, generation):
+        return "*" in self.fence or f"{role}-g{generation}" in self.fence
+
+    def refuse_while_reconciling(self):
+        if self.fence:
+            raise TriadError("Stop is not fully recorded (see reconcile.json); run stop again once storage is "
+                             "available before starting, resuming or dispatching work")
 
     def identity(self, token):
         if secrets.compare_digest(token, self.config["admin_token"]):
@@ -81,6 +104,8 @@ class Core:
             if secrets.compare_digest(token, session["token"]):
                 if session["state"] in {"stopped", "exited"}:
                     raise TriadError("Session authority has been revoked")
+                if self.fenced(session["role"], session["generation"]):
+                    raise TriadError("Session authority has been revoked; its stop awaits reconciliation")
                 return session["role"], session["generation"]
         raise TriadError("Invalid or stale session credential")
 
@@ -229,6 +254,7 @@ class Core:
         role = data.get("role")
         if role not in ROLES or (who[0] == "supervisor" and role != "worker"):
             raise TriadError("Supervisor may start only Worker; roles are supervisor and worker")
+        self.refuse_while_reconciling()
         old = self.store.get("sessions", role)
         if old and old["state"] not in {"stopped", "exited"} and not old.get("start_error"):
             raise TriadError("Session already exists; use replacement for a new generation")
@@ -389,6 +415,7 @@ class Core:
         return {"acknowledged": row["id"]}
 
     def do_assign(self, who, data):
+        self.refuse_while_reconciling()
         if self.store.meta("job")["state"] != "running":
             raise TriadError("Job is paused or stopped")
         session = self.session("worker")
@@ -445,6 +472,7 @@ class Core:
         return task
 
     def do_run_start(self, who, data):
+        self.refuse_while_reconciling()
         task = self.current(who, data)
         if self.store.meta("job")["state"] != "running":
             raise TriadError("Job is not running")
@@ -506,6 +534,7 @@ class Core:
         return task
 
     def do_correct(self, who, data):
+        self.refuse_while_reconciling()
         if self.store.meta("job")["state"] != "running":
             raise TriadError("Job is paused or stopped")
         task = self.task(data["task"])
@@ -548,7 +577,7 @@ class Core:
             errors.append(f"{label} not recorded: {exc}")
 
     def record_reconcile(self, errors):
-        record = {"time": now(), "errors": errors,
+        record = {"time": now(), "errors": errors, "fenced": sorted(self.fence),
                   "terminated": [f"{role}-g{generation}" for role, generation in sorted(self.terminated)]}
         try:
             atomic_json(self.root / "reconcile.json", record)
@@ -590,6 +619,7 @@ class Core:
         if who[0] == "supervisor" and role != "worker":
             raise TriadError("Supervisor can replace only Worker")
         self.refuse_during_takeover(who)
+        self.refuse_while_reconciling()
         old = self.stop_role(role)
         self.store.db.commit()
         return self.do_start(who, {"role": role, "profile": data.get("profile", old["profile"]),
@@ -608,6 +638,7 @@ class Core:
         return job
 
     def do_resume(self, who, data):
+        self.refuse_while_reconciling()
         job = self.store.meta("job")
         if who[0] != "designer" and job["state"] != "running" and (
                 job.get("takeover") or job.get("paused_by", "designer") in DESIGNER_PAUSES):
@@ -625,6 +656,7 @@ class Core:
         return {"escalated": True, "details": data}
 
     def do_takeover(self, who, data):
+        self.refuse_while_reconciling()
         session = self.session(data["role"])
         if session["turn"] != "ready" or any(r["state"] in {"running", "unknown"} for r in self.store.all("runs")):
             raise TriadError("Wait for a ready session and completed commands before takeover")
@@ -654,11 +686,20 @@ class Core:
         # Emergency path: every owned session is stopped even when the database cannot record
         # it. Failures are collected, reported, and kept in reconcile.json for a later stop.
         errors = []
+        reconcile = self.root / "reconcile.json"
+        try:
+            unresolved = read_json(reconcile) if reconcile.exists() else None
+        except (OSError, ValueError):
+            unresolved = {"errors": ["reconcile.json unreadable"]}
+        sessions = [s for s in (self.store.get("sessions", role) for role in ["worker", "supervisor"])
+                    if s and s["state"] != "stopped"]
+        # Fence first, in memory and on disk: until every stop below is durably recorded, the
+        # stopped generations' credentials and new dispatch are refused, even after a restart.
+        self.fence |= {"job"} | {f"{s['role']}-g{s['generation']}" for s in sessions}
+        self.record_reconcile(errors)
         self.persist(errors, "pause", lambda: self.do_pause(who, {}))
-        for role in ["worker", "supervisor"]:
-            session = self.store.get("sessions", role)
-            if not session or session["state"] == "stopped":
-                continue
+        for session in sessions:
+            role = session["role"]
             try:
                 self.terminate(session)
             except Exception as exc:
@@ -669,20 +710,21 @@ class Core:
             self.record_reconcile(errors)
             raise TriadError("Stop incomplete; " + "; ".join(errors) +
                              ". Terminated sessions stay stopped; resolve the cause and run stop again to reconcile")
-        reconcile = self.root / "reconcile.json"
 
         def finish():
             job = self.store.meta("job")
             job["state"] = "stopped"
             self.store.set_meta("job", job)
-            if reconcile.exists():
-                self.store.event("reconciled", read_json(reconcile))
+            if unresolved:
+                self.store.event("reconciled", unresolved)
             self.store.event("stopped", {})
         self.persist(errors, "job stop", finish)
         if errors:
             self.record_reconcile(errors)
             raise TriadError(f"All sessions stopped; {errors[0]}. Run stop again once storage is available")
+        # Every stop is recorded: stale credentials now fail as stopped sessions, so lift the fence.
         reconcile.unlink(missing_ok=True)
+        self.fence = set()
         return self.store.meta("job")
 
     def do_shutdown(self, who, data):
@@ -716,14 +758,19 @@ class Core:
                     # Deadline enforcement is deterministic policy, not a new reasoning role.
                     # The Worker is stopped even when the deadline could not be recorded.
                     worker = self.session("worker")
+                    unconfirmed = []
                     try:
                         if worker["state"] != "stopped":
                             self.terminate(worker)
                             self.persist(errors, "worker stop", lambda: self.record_stopped(worker))
                     except TriadError as exc:
+                        unconfirmed.append(f"worker stop unconfirmed: {exc}")
                         self.persist(errors, "stop_unconfirmed", lambda: self.store.event("stop_unconfirmed", {"error": str(exc)}))
+                    if errors or unconfirmed:
+                        # The expired generation keeps no authority until a Designer stop reconciles it.
+                        self.fence.add(f"worker-g{worker['generation']}")
+                        self.record_reconcile(unconfirmed + errors)
                     if errors:
-                        self.record_reconcile(errors)
                         raise TriadError("Deadline enforcement not fully recorded: " + "; ".join(errors))
                 elif now() - task.get("progress_at", task["assigned_at"]) > 300 and not task.get("stall_reported"):
                     task["stall_reported"] = True

@@ -1,0 +1,19 @@
+{
+  "local": {
+    "kind": "local",
+    "workspace": "C:/work/supervisor-checkout"
+  },
+  "linux-worker": {
+    "kind": "ssh",
+    "target": "user@linux-worker",
+    "root": "/home/user/.triad",
+    "python": "python3"
+  },
+  "linux-supervisor": {
+    "kind": "ssh",
+    "target": "user@linux-supervisor",
+    "root": "/home/user/.triad",
+    "workspace": "/home/user/review-checkout",
+    "python": "python3"
+  }
+}

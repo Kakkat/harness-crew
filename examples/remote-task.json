@@ -1,0 +1,12 @@
+{
+  "objective": "Create greeting.txt containing hello triad followed by a newline",
+  "constraints": ["Preserve existing files", "Do not install dependencies"],
+  "timeout": 600,
+  "checks": [
+    {
+      "name": "greeting",
+      "argv": ["{python}", "-c", "from pathlib import Path; assert Path('greeting.txt').read_text() == 'hello triad' + chr(10)"],
+      "timeout": 20
+    }
+  ]
+}

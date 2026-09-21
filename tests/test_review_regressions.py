@@ -11,10 +11,16 @@ import time
 import unittest
 import zipfile
 
+import secrets
+from unittest.mock import patch
+
 from test_integration import MARKING_HARNESS, ControllerFixture  # Also scrubs inherited TRIAD_* variables.
 from triad.backends import ENTRY, alive, process_identity
+from triad.client import Client
+from triad.connections import LocalConnection
+from triad.core import Core, initialize
 from triad.store import LIMIT_BYTES, RESERVE_BYTES
-from triad.util import TriadError, read_json
+from triad.util import TriadError, read_json, uid
 
 # A check that exits successfully while leaving behind a descendant with all standard streams
 # redirected to DEVNULL (on POSIX also detached into its own session, as a daemon would be).
@@ -182,6 +188,224 @@ class ReviewRegressionTests(ControllerFixture):
         self.proc.wait(timeout=10)
         self.free_database()
         self.launch_controller()  # For tearDown.
+
+
+    def test_stale_credentials_stay_fenced_across_restart_until_stop_reconciles(self):
+        sessions = {role: self.start(role) for role in ["worker", "supervisor"]}
+        tokens = {role: read_json(Path(s["spec"]))["token"] for role, s in sessions.items()}
+        self.fill_database(LIMIT_BYTES)
+        with self.assertRaises(TriadError):
+            self.client.call("stop")
+        for restarted in [False, True]:
+            if restarted:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+                self.launch_controller()
+            for role, token in tokens.items():
+                # A delayed host of a stopped generation fails its startup heartbeat.
+                with self.assertRaisesRegex(TriadError, "revoked"):
+                    Client(self.state, token).call("heartbeat")
+            status = self.client.call("status")
+            self.assertEqual(set(status["reconcile"]["fenced"]), {"job", "worker-g1", "supervisor-g1"})
+            for action, data in [("resume", {}), ("start", {"role": "worker", "profile": "demo-worker"})]:
+                with self.assertRaisesRegex(TriadError, "reconcile"):
+                    self.client.call(action, data)
+        self.free_database()
+        self.assertEqual(self.client.call("stop")["state"], "stopped")
+        self.assertIsNone(self.client.call("status")["reconcile"])
+        self.assertIn("reconciled", self.event_types())
+        with self.assertRaisesRegex(TriadError, "revoked"):
+            Client(self.state, tokens["worker"]).call("heartbeat")
+        self.client.call("resume")
+        self.assertEqual(self.start("worker")["generation"], 2)
+
+
+class ReconciliationFenceTests(unittest.TestCase):
+    """Unit regressions for a stop whose state cannot be recorded (design revision 2 reproduction)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        (self.root / "workspace").mkdir()
+        initialize(self.root / "state", self.root / "workspace")
+        self.core = Core(self.root / "state")
+        self.admin = self.core.config["admin_token"]
+        self.tokens = {role: secrets.token_hex(32) for role in ("worker", "supervisor")}
+        with self.core.store.db:
+            for role, token in self.tokens.items():
+                self.core.store.put("sessions", {"role": role, "generation": 1, "token": token, "profile": "demo-" + role,
+                                                "backend": "local", "host": "local", "state": "alive",
+                                                "turn": "ready", "heartbeat": 1, "created": 1,
+                                                "spec": str(self.root / f"{role}-spec.json")})
+        self.call("design", {"text": "Implement exactly the requested behavior"})
+        self.task = self.call("create_task", {"objective": "x", "checks": [{"name": "x", "argv": ["x"]}]})
+        self.stopped = []
+
+    def tearDown(self):
+        self.core.store.close()
+        self.temp.cleanup()
+
+    def call(self, action, data=None, token=None, core=None):
+        return (core or self.core).rpc(token or self.admin, {"id": uid(), "action": action, "data": data or {}})
+
+    def transport(self, unreachable=()):
+        """Transport stop succeeds (or fails for unreachable roles); starts spawn nothing."""
+        def session(connection, operation, record):
+            if operation == "stop":
+                if record["role"] in unreachable:
+                    raise TriadError(f"{record['role']} host unreachable")
+                self.stopped.append((record["role"], record["generation"]))
+            return {"started": True} if operation == "start" else None
+        return patch.object(LocalConnection, "session", session)
+
+    def failed_stop(self):
+        """Stop with every database write failing, as when SQLite is hard-full."""
+        def persist(core, errors, label, action):
+            errors.append(f"{label} not recorded: database or disk is full")
+        with self.transport(), patch.object(Core, "persist", persist):
+            with self.assertRaisesRegex(TriadError, "database or disk is full"):
+                self.call("stop")
+        self.assertEqual(sorted(self.stopped), [("supervisor", 1), ("worker", 1)])
+        self.assertTrue((self.root / "state" / "reconcile.json").exists())
+
+    def before_and_after_restart(self):
+        yield self.core
+        yield self.reopened()
+
+    def reopened(self):
+        self.core.store.close()
+        self.core = Core(self.root / "state")
+        return self.core
+
+    def test_stale_credentials_refused_before_and_after_restart(self):
+        self.failed_stop()
+        self.assertEqual(self.core.session("worker")["state"], "alive")  # The stop was not recorded.
+        for core in self.before_and_after_restart():
+            for token in self.tokens.values():
+                with self.assertRaisesRegex(TriadError, "revoked"):
+                    core.identity(token)
+                with self.assertRaisesRegex(TriadError, "revoked"):
+                    self.call("heartbeat", token=token)
+            # The Designer keeps read, status and control access.
+            self.assertIn("worker-g1", self.call("status")["reconcile"]["fenced"])
+            self.call("events")
+            self.call("task", {"task": self.task["id"]})
+            self.call("storage")
+
+    def test_start_resume_assign_and_correct_refused_until_reconciled(self):
+        self.failed_stop()
+        for core in self.before_and_after_restart():
+            for action, data in [("start", {"role": "worker", "profile": "demo-worker"}),
+                                 ("replace", {"role": "worker"}), ("resume", {}),
+                                 ("assign", {"task": self.task["id"]}),
+                                 ("correct", {"task": self.task["id"], "instruction": "x"}),
+                                 ("takeover", {"role": "worker"})]:
+                with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
+                    self.call(action, data)
+        self.assertEqual(self.core.store.meta("session_count", 0), 0)
+        self.assertEqual(self.core.task(self.task["id"])["state"], "queued")
+
+    def test_retried_stop_reconciles_and_allows_explicit_resume_and_start(self):
+        self.failed_stop()
+        self.reopened()
+        with self.transport():
+            self.assertEqual(self.call("stop")["state"], "stopped")
+        self.assertFalse((self.root / "state" / "reconcile.json").exists())
+        self.assertEqual({s["state"] for s in self.core.store.all("sessions")}, {"stopped"})
+        self.assertIn("reconciled", [e["type"] for e in self.core.store.events()])
+        for token in self.tokens.values():
+            with self.assertRaisesRegex(TriadError, "revoked"):
+                self.core.identity(token)
+        self.assertEqual(self.reopened().fence, set())
+        self.call("resume")
+        with self.transport():
+            started = self.call("start", {"role": "worker", "profile": "demo-worker"})
+        self.assertEqual(started["generation"], 2)
+        self.assertEqual(self.core.identity(self.core.session("worker")["token"]), ("worker", 2))
+
+    def test_unreachable_session_stays_fenced_until_its_stop_is_confirmed(self):
+        with self.transport(unreachable={"worker"}), self.assertRaisesRegex(TriadError, "worker stop unconfirmed"):
+            self.call("stop")
+        self.assertEqual(self.core.session("supervisor")["state"], "stopped")
+        for core in self.before_and_after_restart():
+            with self.assertRaisesRegex(TriadError, "revoked"):
+                core.identity(self.tokens["worker"])
+            with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
+                self.call("start", {"role": "worker", "profile": "demo-worker"})
+        # Still unreachable: the retry attempts the stop again and keeps the fence.
+        with self.transport(unreachable={"worker"}), self.assertRaises(TriadError):
+            self.call("stop")
+        self.assertIn("worker-g1", self.reopened().fence)
+        with self.transport():
+            self.assertEqual(self.call("stop")["state"], "stopped")
+        self.assertIn(("worker", 1), self.stopped)
+        self.assertEqual(self.core.fence, set())
+        self.call("resume")
+        with self.transport():
+            self.assertEqual(self.call("start", {"role": "worker", "profile": "demo-worker"})["generation"], 2)
+
+    def test_deadline_stop_that_cannot_be_recorded_fences_the_worker(self):
+        self.call("assign", {"task": self.task["id"]}, token=self.tokens["supervisor"])
+        with self.core.store.db:
+            task = self.core.task(self.task["id"])
+            task.update(assigned_at=0, timeout=1)
+            self.core.store.put("tasks", task)
+
+        def persist(core, errors, label, action):
+            errors.append(f"{label} not recorded: database or disk is full")
+        with self.transport(), patch.object(Core, "persist", persist):
+            with self.assertRaisesRegex(TriadError, "Deadline enforcement not fully recorded"):
+                self.core.tick()
+        self.assertIn(("worker", 1), self.stopped)
+        for core in self.before_and_after_restart():
+            with self.assertRaisesRegex(TriadError, "revoked"):
+                core.identity(self.tokens["worker"])
+            self.assertEqual(core.identity(self.tokens["supervisor"]), ("supervisor", 1))
+            with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
+                self.call("replace", {"role": "worker"}, token=self.tokens["supervisor"])
+
+    def test_interrupt_and_replace_that_cannot_be_recorded_keep_the_credential_revoked(self):
+        def persist(core, errors, label, action):
+            errors.append(f"{label} not recorded: database or disk is full")
+        for action in ["interrupt", "replace"]:
+            with self.subTest(action=action):
+                self.stopped.clear()
+                with self.transport(), patch.object(Core, "persist", persist):
+                    with self.assertRaisesRegex(TriadError, "database or disk is full"):
+                        self.call(action, {"role": "worker"}, token=self.tokens["supervisor"])
+                self.assertEqual(self.stopped, [("worker", 1)])
+                self.assertEqual(self.core.session("worker")["state"], "alive")  # Not recorded.
+                for core in self.before_and_after_restart():
+                    with self.assertRaisesRegex(TriadError, "revoked"):
+                        core.identity(self.tokens["worker"])
+                    self.assertEqual(core.identity(self.tokens["supervisor"]), ("supervisor", 1))
+                    with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
+                        self.call("start", {"role": "worker", "profile": "demo-worker"})
+                self.assertEqual(self.core.store.meta("session_count", 0), 0)
+                with self.transport():
+                    self.call("stop")  # Reconciles; the next subtest starts from alive sessions again.
+                self.assertEqual(self.core.fence, set())
+                with self.core.store.db:
+                    for role, token in self.tokens.items():
+                        session = self.core.session(role)
+                        session.update(state="alive", turn="ready")
+                        self.core.store.put("sessions", session)
+                    self.core.store.set_meta("job", self.core.store.meta("job") | {"state": "running"})
+                self.core.terminated.clear()
+
+    def test_recorded_interrupt_lifts_its_fence(self):
+        with self.transport():
+            self.call("interrupt", {"role": "worker"}, token=self.tokens["supervisor"])
+            self.assertEqual(self.core.fence, set())
+            self.assertFalse((self.root / "state" / "reconcile.json").exists())
+            self.assertEqual(self.call("start", {"role": "worker", "profile": "demo-worker"},
+                                       token=self.tokens["supervisor"])["generation"], 2)
+            # An unreachable host is not stopped, so its interrupt revokes nothing.
+            with patch.object(LocalConnection, "session", side_effect=TriadError("unreachable")):
+                with self.assertRaisesRegex(TriadError, "unreachable"):
+                    self.call("interrupt", {"role": "supervisor"})
+        self.assertEqual(self.core.fence, set())
+        self.assertEqual(self.core.identity(self.tokens["supervisor"]), ("supervisor", 1))
 
 
 class InstalledDistributionTests(unittest.TestCase):

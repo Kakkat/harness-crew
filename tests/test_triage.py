@@ -190,6 +190,22 @@ class TriageTests(unittest.TestCase):
             self.tick("ring_doorbells")
             self.assertEqual(rings[-1], "worker")  # Once idle, it is.
 
+    def test_inbox_with_nothing_outstanding_counts_as_ready(self):
+        self.age("sessions", "supervisor", turn="running")  # Acked everything, then forgot `ready`.
+        self.task()
+        self.assertEqual(self.call("inbox", role="supervisor")["type"], "task_created")
+        self.assertEqual(self.core.session("supervisor")["turn"], "running")  # Now holding a message.
+        self.assertIsNone(self.call("inbox", role="supervisor"))  # Unacknowledged: still not free.
+
+    def test_new_supervisor_learns_of_an_already_ready_worker(self):
+        with self.core.store.db:
+            self.core.store.db.execute("DELETE FROM sessions WHERE role='supervisor'")
+        self.task()
+        self.call("ready", role="worker")  # Its notice has no Supervisor to reach.
+        with patch.object(LocalConnection, "session", return_value={"started": True}):
+            self.call("start", {"role": "supervisor", "profile": "demo-supervisor"})
+        self.assertEqual(self.queued("supervisor"), ["recover", "worker_ready"])
+
     def test_instructions_are_role_specific_with_exact_commands(self):
         worker = bootstrap_text("worker", "/s/handoff.json", "CLI", doorbell=True)
         self.assertIn("CLI check --task T --name NAME", worker)

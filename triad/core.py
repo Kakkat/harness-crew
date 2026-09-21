@@ -447,6 +447,9 @@ class Core:
         self.store.event("session_started", {"role": role, "generation": generation, "transport": transport})
         if role == "supervisor":
             self.store.enqueue(role, generation, "recover", recovery)
+            worker = self.store.get("sessions", "worker")
+            if worker and worker["state"] == "alive" and worker["turn"] == "ready":
+                self.worker_ready(worker["generation"])  # Its earlier notice had no Supervisor to reach.
         return {k: v for k, v in session.items() if k not in {"token", "host_config"}} | {"bootstrap": execution_bootstrap}
 
     def do_heartbeat(self, who, data):
@@ -493,6 +496,10 @@ class Core:
         job = self.store.meta("job")
         if job["state"] == "stopped":
             return None
+        if session["turn"] != "ready" and not data.get("redeliver") and self.become_ready(who, strict=False):
+            # Asking for the next message with nothing outstanding means the agent is free: an agent that
+            # forgets the separate `ready` must not freeze the loop (it would never be rung).
+            session = self.session(who[0])
         if data.get("redeliver"):
             # A reply lost after submission stays recoverable: this is not a new dispatch.
             row = self.store.db.execute(

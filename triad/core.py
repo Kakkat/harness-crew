@@ -277,6 +277,8 @@ class Core:
 
     def triage(self):
         """Deterministic follow-ups that would otherwise cost Supervisor turns."""
+        if self.fence:
+            return  # No controller-generated work while a stop awaits reconciliation.
         job = self.store.meta("job")
         tasks = self.store.all("tasks")
         for task in tasks:
@@ -311,6 +313,7 @@ class Core:
         for session in self.store.all("sessions"):
             role = session["role"]
             if (not session.get("doorbell") or session["state"] != "alive" or session["turn"] != "ready"
+                    or "job" in self.fence or self.fenced(role, session["generation"])
                     or job["state"] == "stopped" or job.get("takeover") == role
                     or (role == "worker" and job["state"] != "running")):
                 continue

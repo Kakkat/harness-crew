@@ -243,6 +243,36 @@ class TriageTests(unittest.TestCase):
         run = self.call("run_start", {"task": task["id"], "check": "unit"}, role="worker")
         self.assertFalse(self.call("run_finish", {"run": run["id"], "exit_code": 2}, role="worker")["valid"])
 
+    def test_fenced_sessions_get_no_controller_traffic(self):
+        rings = []
+        real = LocalConnection.session
+
+        def session(connection, operation, record):
+            if operation == "ring":
+                return rings.append(record["role"])
+            return real(connection, operation, record)
+
+        task = self.task()
+        self.drain("supervisor")
+        self.call("assign", {"task": task["id"]}, role="supervisor")
+        self.drain("worker")
+        self.age("sessions", "worker", ready_at=now() - 61, doorbell=True)
+        self.age("sessions", "supervisor", doorbell=True)
+        with self.core.store.db:
+            self.core.store.enqueue("worker", 1, "note", {})
+            self.core.store.enqueue("supervisor", 1, "note", {})
+            self.core.store.db.execute("UPDATE messages SET created=created-4")
+        self.core.fence = {"worker-g1"}  # An unrecorded deadline stop of this Worker.
+        with patch.object(LocalConnection, "session", session):
+            self.tick("triage")
+            self.tick("ring_doorbells")
+            self.assertEqual(self.queued("worker"), ["note"])  # No nudge added.
+            self.assertEqual(rings, ["supervisor"])  # It may still learn what happened; the Worker is not rung.
+            self.core.fence = {"job", "supervisor-g1", "worker-g1"}  # An incomplete stop.
+            self.age("sessions", "supervisor", rung_at=None, rings=0)
+            self.tick("ring_doorbells")
+            self.assertEqual(rings, ["supervisor"])  # Nothing rings until the stop is reconciled.
+
     def test_instructions_are_role_specific_with_exact_commands(self):
         worker = bootstrap_text("worker", "/s/handoff.json", "CLI", doorbell=True)
         self.assertIn("CLI check --task T --name NAME", worker)

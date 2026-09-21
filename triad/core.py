@@ -463,7 +463,9 @@ class Core:
                 raise TriadError("Remote evidence storage budget reached")
         run = {"id": uid("run"), "task": task["id"], "attempt": task["attempt"], "generation": who[1],
                "host": connection.name, "evidence_root": connection.job_root(),
-               "check": check["name"], "argv": [a.replace("{python}", connection.python) for a in check["argv"]], "timeout": check.get("timeout", 300),
+               "check": check["name"], "timeout": check.get("timeout", 300),
+               # {python} and {entry} resolve on the Worker's host, so checks can call this harness's CLI (e.g. `gate`).
+               "argv": [a.replace("{python}", connection.python).replace("{entry}", connection.entry) for a in check["argv"]],
                "cwd": self.config["workspace"], "before": self.snapshot(), "state": "running", "started": now()}
         self.store.put("runs", run)
         self.store.event("run_started", run)

@@ -1,0 +1,33 @@
+{
+  "objective": "Create greeting.txt containing hello triad followed by a newline",
+  "constraints": [
+    "Preserve other files",
+    "Do not add dependencies"
+  ],
+  "timeout": 600,
+  "checks": [
+    {
+      "name": "greeting",
+      "argv": [
+        "{python}",
+        "-c",
+        "from pathlib import Path; assert Path('greeting.txt').read_text() == 'hello triad' + chr(10)"
+      ],
+      "timeout": 20
+    },
+    {
+      "name": "no-new-dependencies",
+      "argv": [
+        "{python}",
+        "{entry}",
+        "gate",
+        "Does this change add a new third-party dependency (an import of an external package, or a new entry in a requirements or package manifest)?",
+        "--expect",
+        "no",
+        "--diff",
+        "HEAD"
+      ],
+      "timeout": 60
+    }
+  ]
+}

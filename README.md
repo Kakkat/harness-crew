@@ -45,7 +45,7 @@ python -m triad --state C:/work/triad-state status
 
 The vendor-named files are **optional launch configurations**, not controller dependencies. Either role can use either file or an entirely different command. Their positional prompt syntax was checked against the installed CLIs' help; live AI behavior and authentication were not exercised in automated tests. Resolve executable paths explicitly if your multiplexer has a different PATH.
 
-Profiles are JSON argument arrays, never shell command strings. Supported substitutions are `{bootstrap}` and `{workspace}`. The generated bootstrap contains the role, current handoff, CLI path, and mailbox procedure. A typical interactive command accepts a prompt telling it to read that file. If your harness has a different interface, adjust the profile or write a structured bridge.
+Profiles are JSON argument arrays, never shell command strings. Supported substitutions are `{bootstrap}` and `{workspace}`. Check commands support `{python}` and `{entry}`, which expand on the Worker's host. The generated bootstrap contains the role, current handoff, CLI path, and mailbox procedure. A typical interactive command accepts a prompt telling it to read that file. If your harness has a different interface, adjust the profile or write a structured bridge.
 
 Harness-native workspace trust, shell/network permissions, and login prompts still apply. Observe the session for setup prompts and resolve them using the harness's normal controls. Triad does not disable permission checks or invent credentials. Some harness sandboxes must explicitly permit the local controller and the state/evidence directory. Native background-daemon modes that escape the owned process tree must not be enabled.
 
@@ -159,6 +159,24 @@ A Worker result is only a candidate. Acceptance requires:
 Fingerprints include untracked files, executable bits, and symlink targets, without following symlinks. FIFOs, sockets, and devices are recorded by type and never opened. `.git` and `__pycache__` are excluded. `config.json` allows additional excluded directory names; configure them narrowly. Large dependency trees can make fingerprinting slow. Verification commands that intentionally alter tracked/source files invalidate their own check: run generators/build preparation first, then use stable checks.
 
 Evidence contains exact command arguments, cwd, timestamps, exit code, timeout/truncation flags, fingerprints, and bounded stdout/stderr. Toolchain/environment immutability is not enforced in v1; use pinned dependencies and a controlled environment for stronger reproducibility. Worker reports and local artifacts are not resistant to deliberate tampering by the same OS account.
+
+## Optional Jev review gates
+
+A check can ask [TypeSafe's Jev](https://docs.typesafe.ai/) one yes/no question about the Worker's changes. Jev is a decision model: it returns a calibrated probability, not text. `triad gate` exits 0 only when Jev gives the expected answer with enough confidence. It exits non-zero on a disagreement and on any error (missing key, network, oversized input), so a gate never passes by accident. The controller itself still makes no AI calls. The gate is an ordinary check command, and its output becomes bounded evidence like any other.
+
+```json
+{"name": "no-new-dependencies",
+ "argv": ["{python}", "{entry}", "gate", "Does this change add a new third-party dependency?",
+          "--expect", "no", "--min", "0.8", "--diff", "HEAD"]}
+```
+
+- `--diff BASE` judges `git diff BASE` plus untracked files in the workspace, which must be a git checkout. `--file PATH`, `--text TEXT` or stdin also work.
+- `{python}` and `{entry}` expand on the Worker's host in every check command, so the same task works locally and over SSH.
+- The key comes from `TYPESAFE_API_KEY`, or from a key file: `--key-file`, `TYPESAFE_API_KEY_FILE`, or `~/.config/typesafe/api_key`. The file holds the plain key, or JSON with `api_key`. It must be available where checks run.
+- Ask narrow questions that name one concrete pattern ("adds a dependency", "disables TLS verification", "removes error handling"). Broad "is anything wrong?" questions answer yes for almost everything.
+- A gate adds to tests; it never replaces them. The judged material is sent to TypeSafe, so don't gate content you can't share. Input is limited to 200,000 characters.
+
+See `examples/jev-gated-task.json`.
 
 ## Storage and token limits
 

@@ -77,6 +77,16 @@ def parser():
     escalation.add_argument("--recommendation", required=True)
     host = sub.add_parser("host", help=argparse.SUPPRESS)
     host.add_argument("--spec", required=True)
+    gate = sub.add_parser("gate", help="Check command: pass only if Jev confidently gives the expected yes/no answer")
+    gate.add_argument("question")
+    gate.add_argument("--expect", choices=["yes", "no"], required=True)
+    gate.add_argument("--min", type=float, default=0.8, help="Required confidence in the expected answer (default 0.8)")
+    material = gate.add_mutually_exclusive_group()
+    material.add_argument("--diff", metavar="BASE", help="Judge `git diff BASE` plus untracked files in the workspace")
+    material.add_argument("--file", help="Judge a file's contents")
+    material.add_argument("--text", help="Judge this text (default: stdin)")
+    gate.add_argument("--model", help="Jev model (default jev-latest)")
+    gate.add_argument("--key-file", help="File with the TypeSafe API key (default ~/.config/typesafe/api_key)")
     contained = sub.add_parser("contain-check", help=argparse.SUPPRESS)
     contained.add_argument("--status", required=True)
     contained.add_argument("argv", nargs=argparse.REMAINDER)
@@ -168,6 +178,14 @@ def main(argv=None):
             from .runtime import host
             host(args.spec)
             return
+        elif command == "gate":
+            from .gate import api_key, gate, git_diff
+            material = (git_diff(args.diff) if args.diff else Path(args.file).read_text(encoding="utf-8")
+                        if args.file else args.text if args.text is not None else sys.stdin.read())
+            passed, p_yes, model = gate(args.question, args.expect, args.min, material, api_key(args.key_file), args.model)
+            print(f"gate {'PASS' if passed else 'FAIL'}: P(yes)={p_yes:.1%}, expected {args.expect} "
+                  f"with at least {args.min:.0%} confidence ({model})")
+            raise SystemExit(0 if passed else 1)
         elif command == "contain-check":
             from .runtime import contain_check
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv

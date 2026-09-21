@@ -299,6 +299,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(retried["generation"], 2)
         self.assertNotIn("start_error", self.core.session("worker"))
 
+    def test_check_argv_expands_python_and_entry_on_worker_host(self):
+        task = self.call("create_task", {"objective": "Gate the change", "checks": [
+            {"name": "gate", "argv": ["{python}", "{entry}", "gate", "Adds a dependency?", "--expect", "no"]}]})
+        self.call("assign", {"task": task["id"]}, role="supervisor")
+        self.call("ack", {"message": self.call("inbox", role="worker")["id"]}, role="worker")
+        run = self.call("run_start", {"task": task["id"], "check": "gate"}, role="worker")
+        from triad.backends import ENTRY
+        self.assertEqual(run["argv"][:3], [sys.executable, str(ENTRY), "gate"])
+
     def test_maintenance_failure_is_recorded_once(self):
         with patch.object(self.core, "tick", side_effect=RuntimeError("probe failed")):
             first = tick_safely(self.core)

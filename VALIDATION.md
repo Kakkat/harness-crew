@@ -53,3 +53,12 @@ Run from clean exports of `eb9840d`, after the repair task was accepted through 
 Scope limits: the conformance harnesses are deterministic executables. Live paid AI sessions were not invoked. Optional Codex and Claude launch-profile syntax was checked using installed CLI help, but their authentication, sandbox configuration, and compliance with the cooperative protocol require live validation. SSH network operations in the unit tests are mocked. The live SSH run above used loopback SSH on one Linux machine; a Windows controller driving a separate Linux host, and tsmux, still require live testing. See SSH.md for the host-check and two-host example.
 
 No external packages, browser runtimes, model weights, or caches were downloaded. Storage limits apply to Triad-owned state and captured logs, not to an external harness's own caches or build outputs.
+
+## Optional Jev review gate (2026-09-21)
+
+`triad gate` asks TypeSafe's Jev one yes/no question and passes only on a confident expected answer. It uses the standard library only; the controller makes no AI calls.
+
+- Tests against a local fake TypeSafe server, never the real API: the threshold, the exact request and Bearer header, failing closed on HTTP errors, malformed replies, and empty or oversized input, key lookup, untracked files in `--diff`, CLI exit codes, and `{entry}` expansion in check commands. **75 tests passed** on Linux (Python 3.12). On Windows (Python 3.13), 75 passed with 5 POSIX-only tests skipped.
+- Live, with the real Jev (`jev-1.13.0`), in two harness jobs using the scripted demo agents and `examples/jev-gated-task.json` unchanged:
+  - Clean change: `greeting` passed; the gate passed with `P(yes)=2.0%`; the task was **accepted**.
+  - A change that adds `import requests` and a `requirements.txt`: `greeting` passed; the gate failed with `P(yes)=99.0%`; the task was **blocked** and could not be accepted.

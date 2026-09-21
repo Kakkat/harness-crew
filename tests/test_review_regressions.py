@@ -364,6 +364,49 @@ class ReconciliationFenceTests(unittest.TestCase):
             with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
                 self.call("replace", {"role": "worker"}, token=self.tokens["supervisor"])
 
+    def test_interrupt_and_replace_that_cannot_be_recorded_keep_the_credential_revoked(self):
+        def persist(core, errors, label, action):
+            errors.append(f"{label} not recorded: database or disk is full")
+        for action in ["interrupt", "replace"]:
+            with self.subTest(action=action):
+                self.stopped.clear()
+                with self.transport(), patch.object(Core, "persist", persist):
+                    with self.assertRaisesRegex(TriadError, "database or disk is full"):
+                        self.call(action, {"role": "worker"}, token=self.tokens["supervisor"])
+                self.assertEqual(self.stopped, [("worker", 1)])
+                self.assertEqual(self.core.session("worker")["state"], "alive")  # Not recorded.
+                for core in self.before_and_after_restart():
+                    with self.assertRaisesRegex(TriadError, "revoked"):
+                        core.identity(self.tokens["worker"])
+                    self.assertEqual(core.identity(self.tokens["supervisor"]), ("supervisor", 1))
+                    with self.transport(), self.assertRaisesRegex(TriadError, "reconcile"):
+                        self.call("start", {"role": "worker", "profile": "demo-worker"})
+                self.assertEqual(self.core.store.meta("session_count", 0), 0)
+                with self.transport():
+                    self.call("stop")  # Reconciles; the next subtest starts from alive sessions again.
+                self.assertEqual(self.core.fence, set())
+                with self.core.store.db:
+                    for role, token in self.tokens.items():
+                        session = self.core.session(role)
+                        session.update(state="alive", turn="ready")
+                        self.core.store.put("sessions", session)
+                    self.core.store.set_meta("job", self.core.store.meta("job") | {"state": "running"})
+                self.core.terminated.clear()
+
+    def test_recorded_interrupt_lifts_its_fence(self):
+        with self.transport():
+            self.call("interrupt", {"role": "worker"}, token=self.tokens["supervisor"])
+            self.assertEqual(self.core.fence, set())
+            self.assertFalse((self.root / "state" / "reconcile.json").exists())
+            self.assertEqual(self.call("start", {"role": "worker", "profile": "demo-worker"},
+                                       token=self.tokens["supervisor"])["generation"], 2)
+            # An unreachable host is not stopped, so its interrupt revokes nothing.
+            with patch.object(LocalConnection, "session", side_effect=TriadError("unreachable")):
+                with self.assertRaisesRegex(TriadError, "unreachable"):
+                    self.call("interrupt", {"role": "supervisor"})
+        self.assertEqual(self.core.fence, set())
+        self.assertEqual(self.core.identity(self.tokens["supervisor"]), ("supervisor", 1))
+
 
 class InstalledDistributionTests(unittest.TestCase):
     def test_wheel_runs_demo_and_ssh_bundle_outside_checkout(self):

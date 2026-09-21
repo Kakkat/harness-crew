@@ -556,8 +556,27 @@ class Core:
         session = self.session(role)
         if session["state"] == "stopped":
             return session
-        self.terminate(session)
-        return self.record_stopped(session)
+        key = f"{role}-g{session['generation']}"
+        previous = set(self.fence)
+        # Fence durably before terminating, as stop does: a termination whose record then fails
+        # must not leave the old credential valid, now or after a controller restart.
+        self.fence.add(key)
+        self.write_fence()
+        try:
+            self.terminate(session)
+        except Exception:
+            self.fence = previous  # Not stopped: the session keeps the authority it had.
+            self.write_fence()
+            raise
+        errors = []
+        self.persist(errors, f"{role} stop", lambda: self.record_stopped(session))
+        if errors:
+            self.record_reconcile(errors)
+            raise TriadError(f"{role} stopped; {errors[0]}. Its credential stays revoked; "
+                             "run stop once storage is available to reconcile")
+        self.fence.discard(key)  # Durably recorded as stopped.
+        self.write_fence()
+        return session
 
     def terminate(self, session):
         """Stop a session's processes. Uses only its spec and host identity, never new writes."""
@@ -583,6 +602,17 @@ class Core:
             atomic_json(self.root / "reconcile.json", record)
         except OSError:
             pass  # The error is still reported to the caller.
+
+    def write_fence(self):
+        path = self.root / "reconcile.json"
+        if self.fence:
+            try:
+                errors = read_json(path).get("errors", []) if path.exists() else []
+            except (OSError, ValueError, AttributeError):
+                errors = []
+            self.record_reconcile(errors)
+        else:
+            path.unlink(missing_ok=True)
 
     def record_stopped(self, session):
         role = session["role"]

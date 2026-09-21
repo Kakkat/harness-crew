@@ -463,20 +463,28 @@ class Core:
     def do_ready(self, who, data):
         if who[0] not in ROLES:
             raise TriadError("Ready requires a session credential")
+        self.become_ready(who)
+        return {"ready": True}
+
+    def become_ready(self, who, strict=True):
+        """Mark a session quiescent. Non-strict callers (result, blocked) skip it if not yet possible."""
         session = self.session(who[0])
         outstanding = self.store.db.execute(
             "SELECT id FROM messages WHERE recipient=? AND generation=? AND state='submitted'",
             who).fetchone()
+        busy = who[0] == "worker" and any(r["state"] in {"running", "unknown"} for r in self.store.all("runs"))
+        if not strict and (outstanding or busy):
+            return False
         if outstanding:
             raise TriadError(f"Acknowledge submitted message {outstanding['id']} before declaring ready")
-        if who[0] == "worker" and any(r["state"] in {"running", "unknown"} for r in self.store.all("runs")):
+        if busy:
             raise TriadError("A verification command is still running")
         session.update(state="alive", turn="ready", heartbeat=now(), ready_at=now())
         self.store.put("sessions", session)
         self.store.event("turn_ended", {"role": who[0], "generation": who[1]})
         if who[0] == "worker":
             self.worker_ready(who[1])
-        return {"ready": True}
+        return True
 
     def do_inbox(self, who, data):
         if who[0] not in ROLES:
@@ -564,14 +572,20 @@ class Core:
         self.store.put("tasks", task)
         self.store.event("result", {"task": task["id"], **task["result"]})
         if self.session("worker")["turn"] == "ready":
-            self.deliver_result(task)  # Already quiescent; otherwise delivered by its next `ready`.
-        return task
+            self.deliver_result(task)
+        else:
+            # A result declares the work done, so it also counts as `ready`: a Worker that forgets the
+            # separate `ready` must not leave the Supervisor waiting. Acceptance still re-checks the
+            # snapshot, so later edits cannot slip through.
+            self.become_ready(who, strict=False)
+        return self.task(task["id"])
 
     def do_blocked(self, who, data):
         task = self.current(who, data)
         task.update(state="blocked", reason=str(data.get("reason", "Unspecified blocker"))[:4000])
         self.store.put("tasks", task)
         self.notify("blocked", {"task": task["id"], "reason": task["reason"]})
+        self.become_ready(who, strict=False)  # Reporting a blocker also ends the Worker's turn.
         return task
 
     def do_run_start(self, who, data):

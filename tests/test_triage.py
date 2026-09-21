@@ -84,7 +84,7 @@ class TriageTests(unittest.TestCase):
         self.drain("worker")  # Worker handles the assignment and declares ready again.
         self.assertEqual(self.queued("supervisor"), [])  # Active task, no result: not the Supervisor's turn.
 
-    def test_result_reaches_supervisor_once_worker_is_ready(self):
+    def test_result_is_delivered_with_the_worker_ready(self):
         task = self.task()
         self.drain("supervisor")
         self.call("assign", {"task": task["id"]}, role="supervisor")
@@ -93,9 +93,10 @@ class TriageTests(unittest.TestCase):
         run = self.call("run_start", {"task": task["id"], "check": "unit"}, role="worker")
         self.call("run_finish", {"run": run["id"], "exit_code": 0}, role="worker")
         self.call("result", {"task": task["id"], "summary": "done", "evidence": [run["id"]]}, role="worker")
-        self.assertEqual(self.queued("supervisor"), [])  # Worker still busy: hold the result.
-        self.call("ready", role="worker")
+        self.assertEqual(self.core.session("worker")["turn"], "ready")  # A result also ends the Worker's turn.
         self.assertEqual(self.queued("supervisor"), ["result"])  # One message, acceptable immediately.
+        self.call("ready", role="worker")  # A Worker that still calls ready adds nothing.
+        self.assertEqual(self.queued("supervisor"), ["result"])
         self.drain("supervisor")
         self.assertEqual(self.call("accept", {"task": task["id"]}, role="supervisor")["state"], "accepted")
 
@@ -105,6 +106,9 @@ class TriageTests(unittest.TestCase):
         self.call("assign", {"task": task["id"]}, role="supervisor")
         message = self.call("inbox", role="worker")
         self.call("ack", {"message": message["id"]}, role="worker")
+        self.call("ready", role="worker")
+        self.call("correct", {"task": task["id"], "instruction": "One more thing"})
+        self.call("inbox", role="worker")  # Left unacknowledged, so the result cannot end the turn.
         run = self.call("run_start", {"task": task["id"], "check": "unit"}, role="worker")
         self.call("run_finish", {"run": run["id"], "exit_code": 0}, role="worker")
         self.call("result", {"task": task["id"], "summary": "done", "evidence": [run["id"]]}, role="worker")

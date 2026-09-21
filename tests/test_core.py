@@ -117,11 +117,19 @@ class CoreTests(unittest.TestCase):
     def test_result_is_not_acceptance(self):
         task = self.assign()
         self.passing(task)
-        with self.assertRaises(TriadError):
-            self.call("accept", {"task": task["id"]}, role="supervisor")
-        self.call("ready", role="worker")
+        self.assertEqual(self.core.task(task["id"])["state"], "awaiting_verification")  # Only a candidate.
         accepted = self.call("accept", {"task": task["id"]}, role="supervisor")
         self.assertEqual(accepted["state"], "accepted")
+
+    def test_result_counts_as_ready_only_when_worker_is_quiescent(self):
+        task = self.assign()
+        self.call("ready", role="worker")
+        self.call("correct", {"task": task["id"], "instruction": "Also handle blanks"})
+        self.assertEqual(self.call("inbox", role="worker")["type"], "correct")  # Delivered, not acknowledged.
+        self.passing(task)
+        self.assertEqual(self.core.session("worker")["turn"], "running")
+        with self.assertRaises(TriadError):
+            self.call("accept", {"task": task["id"]}, role="supervisor")
 
     def test_changed_workspace_invalidates_evidence(self):
         task = self.assign()

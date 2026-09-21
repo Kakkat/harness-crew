@@ -21,6 +21,51 @@ SESSION_ACTIONS = {"inbox", "ack", "ready", "heartbeat", "progress"}
 DESIGNER_PAUSES = {"designer", "escalation", "takeover"}
 # Idempotent emergency controls: they may use reserved storage and keep no request receipt.
 CONTROLS = {"stop", "shutdown"}
+ACTIVE = {"assigned", "working", "awaiting_verification"}
+MULTIPLEXERS = {"psmux", "tmux", "tsmux"}
+IDLE_NUDGE_AFTER = 60  # Seconds a Worker may sit ready on an unfinished task before it is nudged.
+MAX_NUDGES = 2         # Controller nudges per task before the Supervisor is woken.
+RESULT_GRACE = 60      # Seconds to wait for a Worker to become ready before delivering its result anyway.
+DOORBELL_DELAY = 3     # A polling agent collects a message within this time; only then ring.
+DOORBELL_RETRY = 60
+DOORBELL_MAX = 3
+
+
+def bootstrap_text(role, handoff, cli, doorbell):
+    """Role-specific instructions with exact commands; agents follow examples far better than prose."""
+    wait = (f"2. {cli} inbox   (returns one message as JSON, or null)\n"
+            "   If it returns null, END YOUR TURN and wait. Do not poll, sleep or run inbox --wait. When a message\n"
+            "   arrives, the harness types a notice into this terminal; then continue at step 2.\n"
+            if doorbell else
+            f"2. {cli} inbox --wait   (waits for one message as JSON; if it returns null, run it again)\n")
+    if role == "worker":
+        handle = (
+            "   assign / correct / nudge for task T: implement within the design, then run EVERY named check of T:\n"
+            f"     {cli} check --task T --name NAME      (prints JSON with \"id\" and \"valid\")\n"
+            "   Fix and re-run until every check is valid, then submit the run IDs:\n"
+            f"     {cli} result --task T --summary \"one line\" --evidence RUN_ID [RUN_ID ...]\n"
+            "   Running tests yourself is not evidence; only `check` runs count. If you cannot finish:\n"
+            f"     {cli} blocked --task T --reason \"why\"\n")
+    else:
+        handle = (
+            "   recover / design / task_created / worker_ready: assign waiting tasks when the Worker is ready:\n"
+            f"     {cli} assign --task T\n"
+            "   result: the Worker finished task T and is idle. Decide:\n"
+            f"     {cli} accept --task T        (the controller verifies every check passed on the current files)\n"
+            f"     {cli} correct --task T --instruction \"what to change\"\n"
+            "   blocked / worker_idle / progress_review / task_deadline / session_exited: investigate with\n"
+            f"     {cli} status   |   {cli} task --task T   |   {cli} evidence --run R --file stderr.log\n"
+            f"   then correct, reassign, or: {cli} escalate --reason \"...\" --recommendation \"...\"\n")
+    return (
+        f"You are the {role.upper()} logical role. Read {handoff} for the design, tasks and evidence.\n"
+        f"The Triad CLI is: {cli}\n"
+        "TRIAD_STATE and TRIAD_TOKEN are already set. The controller is infrastructure and may run on another host.\n\n"
+        f"Loop:\n1. {cli} ready\n{wait}"
+        f"3. {cli} ack --message ID, then handle the message:\n{handle}"
+        "4. Go to step 1.\n\n"
+        "Keep implementation decisions within the design; escalate design problems instead of changing it.\n"
+        "Never communicate Worker results directly to the Designer. Keep summaries short and reference run IDs.\n"
+        "Do not launch detached/unowned processes, bypass process containment, or edit controller state.\n")
 
 
 def initialize(root, workspace, backend_name="local", hosts=None, workspace_host="local"):
@@ -141,9 +186,97 @@ class Core:
 
     def notify(self, kind, data):
         self.store.event(kind, data)
+        return self.message_supervisor(kind, data)
+
+    def message_supervisor(self, kind, data):
         session = self.store.get("sessions", "supervisor")
         if session and session["state"] not in {"stopped", "exited"}:
             return self.store.enqueue("supervisor", session["generation"], kind, data)
+
+    def cli_for(self, session):
+        connection = self.connections.for_session(session)
+        return f'"{connection.python}" "{connection.entry}"'
+
+    def worker_ready(self, generation):
+        """Wake the Supervisor for a ready Worker only when it has something to decide."""
+        tasks = self.store.all("tasks")
+        for task in tasks:
+            if (task["state"] == "awaiting_verification" and task.get("generation") == generation
+                    and not task.get("result_notified")):
+                return self.deliver_result(task)
+        assignable = [t["id"] for t in tasks if t["state"] == "queued"
+                      or (t["state"] == "blocked" and t.get("generation") != generation)]
+        if assignable and not any(t["state"] in ACTIVE for t in tasks):
+            return self.notify("worker_ready", {"generation": generation, "assignable": assignable})
+        self.store.event("worker_ready", {"generation": generation})
+
+    def deliver_result(self, task, worker_ready=True):
+        """One Supervisor message per result, sent when the Worker is quiescent so it can be accepted at once."""
+        task["result_notified"] = True
+        self.store.put("tasks", task)
+        return self.message_supervisor("result", {"task": task["id"], **task["result"], "worker_ready": worker_ready})
+
+    def nudge_text(self, worker, task):
+        cli = self.cli_for(worker)
+        names = ", ".join(check["name"] for check in task["checks"])
+        return (f"Task {task['id']} is assigned to you but has no result yet. If the work is done, run every named check "
+                f"({names}) with: {cli} check --task {task['id']} --name NAME. Then submit the run IDs: {cli} result "
+                f"--task {task['id']} --summary \"one line\" --evidence RUN_ID [RUN_ID ...]. Running tests yourself is "
+                f"not evidence. If you cannot finish, run: {cli} blocked --task {task['id']} --reason \"why\". Then call ready.")
+
+    def triage(self):
+        """Deterministic follow-ups that would otherwise cost Supervisor turns."""
+        job = self.store.meta("job")
+        tasks = self.store.all("tasks")
+        for task in tasks:
+            if (task["state"] == "awaiting_verification" and not task.get("result_notified")
+                    and now() - task["result"].get("submitted_at", 0) > RESULT_GRACE):
+                self.deliver_result(task, worker_ready=False)  # The Worker never became ready; let the Supervisor look.
+        worker = self.store.get("sessions", "worker")
+        if not worker or worker["state"] != "alive" or worker["turn"] != "ready" or job["state"] != "running":
+            return
+        task = next((t for t in tasks if t["state"] in {"assigned", "working"}
+                     and t.get("generation") == worker["generation"]), None)
+        pending = self.store.db.execute(
+            "SELECT 1 FROM messages WHERE recipient='worker' AND generation=? AND state IN ('queued','submitted')",
+            (worker["generation"],)).fetchone()
+        if not task or pending or now() - max(worker.get("ready_at") or 0, task.get("nudged_at") or 0) < IDLE_NUDGE_AFTER:
+            return
+        if task.get("nudges", 0) < MAX_NUDGES:
+            task.update(nudges=task.get("nudges", 0) + 1, nudged_at=now())
+            self.store.put("tasks", task)
+            self.store.enqueue("worker", worker["generation"], "nudge",
+                               {"task": task["id"], "instruction": self.nudge_text(worker, task)})
+            self.store.event("worker_nudged", {"task": task["id"], "count": task["nudges"]})
+        elif not task.get("idle_reported"):
+            task["idle_reported"] = True
+            self.store.put("tasks", task)
+            self.notify("worker_idle", {"task": task["id"], "nudges": task["nudges"],
+                                        "note": "Worker stays ready without a result after nudges"})
+
+    def ring_doorbells(self):
+        """Event-based wake-up: type one notice into an idle agent's terminal when a message waits for it."""
+        job = self.store.meta("job")
+        for session in self.store.all("sessions"):
+            role = session["role"]
+            if (not session.get("doorbell") or session["state"] != "alive" or session["turn"] != "ready"
+                    or job["state"] == "stopped" or job.get("takeover") == role
+                    or (role == "worker" and job["state"] != "running")):
+                continue
+            row = self.store.db.execute(
+                "SELECT created FROM messages WHERE recipient=? AND generation=? AND state='queued' ORDER BY created LIMIT 1",
+                (role, session["generation"])).fetchone()
+            if (not row or now() - row["created"] < DOORBELL_DELAY or session.get("rings", 0) >= DOORBELL_MAX
+                    or now() - (session.get("rung_at") or 0) < DOORBELL_RETRY):
+                continue
+            try:
+                self.connections.for_session(session).session("ring", session)
+            except TriadError as exc:
+                self.store.event("doorbell_failed", {"role": role, "error": str(exc)})
+                continue
+            session.update(rung_at=now(), rings=session.get("rings", 0) + 1)
+            self.store.put("sessions", session)
+            self.store.event("doorbell", {"role": role, "generation": session["generation"], "ring": session["rings"]})
 
     def current(self, who, data):
         task = self.task(data["task"])
@@ -283,24 +416,18 @@ class Core:
                          if connection.kind == "ssh" else str(session_dir))
         execution_bootstrap = execution_dir + "/bootstrap.md"
         cli = f'"{connection.python}" "{connection.entry}"'
-        bootstrap_text = (
-            f"You are the {role.upper()} logical role. Read {execution_dir}/handoff.json.\n"
-            "The controller is infrastructure and may run on another host. Keep implementation decisions within the design.\n"
-            f"Use {cli} --help for the role API. TRIAD_STATE and TRIAD_TOKEN are already set.\n"
-            f"Begin with: {cli} ready\nThen: {cli} inbox --wait\n"
-            "Acknowledge every delivered message using ack --message ID. Read one message at a time.\n"
-            "Worker: inspect, implement, run named checks, fix and repeat independently. Report result or blocked.\n"
-            "Supervisor: start/reuse Worker; assign tasks; interpret results; accept only current evidence; escalate design issues.\n"
-            "After handling each message call ready, then inbox --wait again. This marks an explicit protocol boundary.\n"
-            "Never communicate Worker results directly to Designer. Keep summaries short and reference run IDs.\n"
-            "Do not launch detached/unowned processes, bypass process containment, or edit controller state.\n")
-        bootstrap.write_text(bootstrap_text, encoding="utf-8")
+        # Interactive agents in a multiplexer wait with their turn ended; a doorbell wakes them per message.
+        doorbell = profile["mode"] == "cooperative" and backend_name in MULTIPLEXERS and self.config.get("doorbell", True)
+        session["doorbell"] = doorbell
+        instructions = bootstrap_text(role, execution_dir + "/handoff.json", cli, doorbell)
+        bootstrap.write_text(instructions, encoding="utf-8")
         argv = [part.replace("{bootstrap}", execution_bootstrap).replace("{workspace}", workspace)
                 .replace("{python}", connection.python).replace("{entry}", connection.entry)
                 for part in profile["argv"]]
         spec = {**session, "state_dir": connection.job_root(), "workspace": workspace,
                 "mode": profile["mode"], "argv": argv, "log_bytes": self.config["log_bytes"],
-                "session_name": f"triad-{self.config['job'][-8:]}-{role}-g{generation}"}
+                "session_name": f"triad-{self.config['job'][-8:]}-{role}-g{generation}",
+                "doorbell_text": f"[triad] A new message is waiting. Receive it now with: {cli} inbox"}
         atomic_json(Path(session["spec"]), spec)
         self.store.put("sessions", session)
         self.store.set_meta("session_count", count + 1)
@@ -308,7 +435,7 @@ class Core:
         # Reserve before spawning. A crash leaves a discoverable generation, never an invisible process.
         self.store.db.commit()
         try:
-            spec = connection.prepare(spec, bootstrap_text, recovery)
+            spec = connection.prepare(spec, instructions, recovery)
             atomic_json(Path(session["spec"]), spec)
             transport = connection.session("start", session)
         except Exception as exc:
@@ -344,11 +471,11 @@ class Core:
             raise TriadError(f"Acknowledge submitted message {outstanding['id']} before declaring ready")
         if who[0] == "worker" and any(r["state"] in {"running", "unknown"} for r in self.store.all("runs")):
             raise TriadError("A verification command is still running")
-        session.update(state="alive", turn="ready", heartbeat=now())
+        session.update(state="alive", turn="ready", heartbeat=now(), ready_at=now())
         self.store.put("sessions", session)
         self.store.event("turn_ended", {"role": who[0], "generation": who[1]})
         if who[0] == "worker":
-            self.notify("worker_ready", {"generation": who[1]})
+            self.worker_ready(who[1])
         return {"ready": True}
 
     def do_inbox(self, who, data):
@@ -373,7 +500,7 @@ class Core:
         if not row:
             return None
         self.store.db.execute("UPDATE messages SET state='submitted' WHERE id=?", (row["id"],))
-        session["turn"] = "running"
+        session.update(turn="running", rings=0, rung_at=None)
         self.store.put("sessions", session)
         self.store.event("message_submitted", {"id": row["id"], "role": who[0]})
         return json.loads(row["data"])
@@ -431,10 +558,13 @@ class Core:
             run = self.store.get("runs", run_id)
             if not run or (run["task"], run["attempt"], run["generation"]) != (task["id"], task["attempt"], who[1]):
                 raise TriadError("Evidence belongs to a different task or attempt")
-        task.update(state="awaiting_verification", result={"summary": data["summary"], "evidence": evidence,
-                    "snapshot": self.snapshot(), "open_issues": data.get("open_issues", [])})
+        task.update(state="awaiting_verification", result_notified=False, result={
+            "summary": data["summary"], "evidence": evidence, "snapshot": self.snapshot(),
+            "open_issues": data.get("open_issues", []), "submitted_at": now()})
         self.store.put("tasks", task)
-        self.notify("result", {"task": task["id"], **task["result"]})
+        self.store.event("result", {"task": task["id"], **task["result"]})
+        if self.session("worker")["turn"] == "ready":
+            self.deliver_result(task)  # Already quiescent; otherwise delivered by its next `ready`.
         return task
 
     def do_blocked(self, who, data):
@@ -727,10 +857,14 @@ class Core:
                     if errors:
                         self.record_reconcile(errors)
                         raise TriadError("Deadline enforcement not fully recorded: " + "; ".join(errors))
-                elif now() - task.get("progress_at", task["assigned_at"]) > 300 and not task.get("stall_reported"):
+                elif (now() - task.get("progress_at", task["assigned_at"]) > 300 and not task.get("stall_reported")
+                      and (self.store.get("sessions", "worker") or {}).get("turn") == "running"):
+                    # A quiet but idle Worker is nudged by triage(); only a busy, silent one needs the Supervisor.
                     task["stall_reported"] = True
                     self.store.put("tasks", task)
                     self.notify("progress_review", {"task": task["id"], "note": "Quiet is not failure; inspect active commands"})
+            self.triage()
+            self.ring_doorbells()
             for session in self.store.all("sessions"):
                 if session["state"] in {"stopped", "exited"}:
                     continue

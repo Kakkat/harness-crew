@@ -130,30 +130,33 @@ def kill_posix_tree(pid, include_root=True):
         except ProcessLookupError:
             return owned
         owned[pid] = process_identity(pid)
-    for _ in range(50):
-        children = {}
-        for row in posix_processes("pid=,ppid="):
-            children.setdefault(int(row[1]), []).append(int(row[0]))
-        tree, found = [pid], False
-        for parent in tree:
-            for child in children.get(parent, ()):
-                if child in tree:
-                    continue
-                tree.append(child)
-                if child not in owned:
-                    try:
-                        os.kill(child, signal.SIGSTOP)
-                    except ProcessLookupError:
+    try:
+        for _ in range(50):
+            children = {}
+            for row in posix_processes("pid=,ppid="):
+                children.setdefault(int(row[1]), []).append(int(row[0]))
+            tree, found = [pid], False
+            for parent in tree:
+                for child in children.get(parent, ()):
+                    if child in tree:
                         continue
-                    owned[child] = process_identity(child)
-                    found = True
-        if not found:
-            break
-    for process in reversed(list(owned)):
-        try:
-            os.kill(process, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+                    tree.append(child)
+                    if child not in owned:
+                        try:
+                            os.kill(child, signal.SIGSTOP)
+                        except ProcessLookupError:
+                            continue
+                        owned[child] = process_identity(child)
+                        found = True
+            if not found:
+                break
+    finally:
+        # Even when a listing fails, nothing already stopped may stay frozen: kill what was found.
+        for process in reversed(list(owned)):
+            try:
+                os.kill(process, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     return owned
 
 
@@ -204,6 +207,9 @@ class LocalBackend:
     def attach(self, spec):
         raise TriadError("Local backend has log observation only; use a multiplexer for interactive attachment")
 
+    def ring(self, spec):
+        raise TriadError("Local backend has no terminal to ring; structured sessions receive messages on stdin")
+
 
 class MuxBackend(LocalBackend):
     def __init__(self, executable):
@@ -211,6 +217,13 @@ class MuxBackend(LocalBackend):
         self.name = executable
         if not self.executable:
             raise TriadError(f"Session backend is not installed: {executable}")
+
+    def target(self, name, pane=False):
+        """tmux resolves -t by prefix when no exact match exists ("…-g1" can hit "…-g10"); "=" forces exact.
+        psmux does not support "=", so it keeps plain names."""
+        if self.name != "tmux":
+            return name
+        return f"={name}:" if pane else f"={name}"
 
     def command(self, *args, check=True):
         try:
@@ -224,7 +237,7 @@ class MuxBackend(LocalBackend):
     def start(self, spec):
         data = read_json(Path(spec))
         name = data["session_name"]
-        if self.command("has-session", "-t", name, check=False).returncode == 0:
+        if self.command("has-session", "-t", self.target(name), check=False).returncode == 0:
             return {"backend": self.name, "name": name, "adopted": True}
         argv = [sys.executable, "-B", str(ENTRY), "host", "--spec", str(spec)]
         if os.name == "nt":
@@ -237,22 +250,29 @@ class MuxBackend(LocalBackend):
         else:
             command = "exec " + shlex.join(argv)
         self.command("new-session", "-d", "-s", name, "-c", data["workspace"], command)
-        self.command("set-option", "-t", name, "history-limit", "2000", check=False)
+        self.command("set-option", "-t", self.target(name), "history-limit", "2000", check=False)
         return {"backend": self.name, "name": name}
 
     def stop(self, spec):
         super().stop(spec)
         data = read_json(Path(spec))
-        self.command("kill-session", "-t", data["session_name"], check=False)
+        self.command("kill-session", "-t", self.target(data["session_name"]), check=False)
 
     def capture(self, spec):
         data = read_json(Path(spec))
-        p = self.command("capture-pane", "-p", "-t", data["session_name"], check=False)
+        p = self.command("capture-pane", "-p", "-t", self.target(data["session_name"], pane=True), check=False)
         return p.stdout[-16384:] if p.returncode == 0 and p.stdout.strip() else super().capture(spec)
 
     def attach(self, spec):
         data = read_json(Path(spec))
-        return [self.executable, "attach-session", "-t", data["session_name"]]
+        return [self.executable, "attach-session", "-t", self.target(data["session_name"])]
+
+    def ring(self, spec):
+        """Doorbell: type one notice line into the agent's idle prompt and submit it."""
+        data = read_json(Path(spec))
+        target = self.target(data["session_name"], pane=True)
+        self.command("send-keys", "-t", target, "-l", data["doorbell_text"])
+        self.command("send-keys", "-t", target, "Enter")
 
 
 def backend(name):

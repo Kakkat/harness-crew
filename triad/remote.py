@@ -54,7 +54,7 @@ def operation(name, data):
             return alive(Path(data["spec"]).parent)
         if action == "stop":
             return stop_session(data["backend"], data["spec"])
-        if action not in {"start", "capture", "attach"}:
+        if action not in {"start", "capture", "attach", "ring"}:
             raise TriadError("Unsupported session operation")
         return getattr(backend(data["backend"]), action)(data["spec"])
     if name == "evidence":

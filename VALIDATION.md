@@ -39,7 +39,16 @@ Four findings from the review of `6a03d86` were fixed and validated on Ubuntu Li
 - `python3 -m unittest discover -s tests`: **68 tests passed, none skipped** (72.6 s), run with an enclosing Triad session's `TRIAD_*` variables present. Test modules now scrub those variables. Before this change, inherited variables caused 10 integration failures and left controllers running when `setUp` failed; each fixture controller now has a cleanup hook.
 - Demo from the checkout with `--backend local` and `--backend tmux`: both tasks accepted; no demo tmux sessions or processes remained.
 
-Limits of this round: the Windows Job Object quiescence path (`QueryInformationJobObject` active-process count) and the macOS/BSD process-group fallback were not executed; they need Windows validation. On non-Linux POSIX, a check descendant that leaves the process group is not observed. Checks that intentionally leave a background process running now time out instead of passing.
+Limits of this round: the macOS/BSD process-group fallback was not executed. On non-Linux POSIX, a check descendant that leaves the process group is not observed. Checks that intentionally leave a background process running now time out instead of passing.
+
+## Designer validation of the review fixes (2026-09-21)
+
+Run from clean exports of `eb9840d`, after the repair task was accepted through Triad.
+
+- Windows, Python 3.13.14 with psmux: **68 tests passed**, with 5 POSIX/Linux-only tests skipped. All six regressions passed. That includes both check-containment tests, which run the Windows Job Object active-process count, and the installed-wheel test.
+- Linux: 68 tests passed. The `--backend local` and `--backend tmux` demos were accepted.
+- Live SSH over loopback on Linux: the remote tmux Worker's task was accepted. A backend missing on the remote host was rejected before a generation was reserved. After `kill -9` on the controller and `up`, the same remote Worker completed a second task. No sessions, hosts or tunnel helpers remained.
+- The repair itself went through Triad. The Worker was Claude Opus (high effort) on Linux. The Supervisor was Claude Opus (low effort), after the Codex Supervisor hit its usage limit. It was accepted on attempt 2 with fresh evidence: `regressions` (6 passed) and `full-suite` (68 passed).
 
 Scope limits: the conformance harnesses are deterministic executables. Live paid AI sessions were not invoked. Optional Codex and Claude launch-profile syntax was checked using installed CLI help, but their authentication, sandbox configuration, and compliance with the cooperative protocol require live validation. SSH network operations in the unit tests are mocked. The live SSH run above used loopback SSH on one Linux machine; a Windows controller driving a separate Linux host, and tsmux, still require live testing. See SSH.md for the host-check and two-host example.
 

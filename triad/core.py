@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 import secrets
 import sys
 
-from .backends import ENTRY, alive, backend
+from .backends import BACKENDS, ENTRY, alive, backend
 from .connections import Connections, ConnectionUnavailable, validate_host
 from .store import Store
 from .util import TriadError, atomic_json, fingerprint, now, read_json, uid
@@ -15,6 +15,8 @@ from .util import TriadError, atomic_json, fingerprint, now, read_json, uid
 ROLES = {"supervisor", "worker"}
 READS = {"status", "events", "task", "observe", "storage", "evidence"}
 SESSION_ACTIONS = {"inbox", "ack", "ready", "heartbeat", "progress"}
+# Pauses that only the Designer may lift. The Supervisor may resume its own and deadline pauses.
+DESIGNER_PAUSES = {"designer", "escalation", "takeover"}
 
 
 def initialize(root, workspace, backend_name="local", hosts=None, workspace_host="local"):
@@ -35,6 +37,8 @@ def initialize(root, workspace, backend_name="local", hosts=None, workspace_host
     root.mkdir(parents=True, exist_ok=True)
     if (root / "config.json").exists():
         raise TriadError("State directory is already initialized")
+    if os.name != "nt":
+        root.chmod(0o700)  # Before the admin token exists on disk.
     config = {"version": 1, "job": uid("job"), "workspace": str(workspace),
               "backend": backend_name, "hosts": hosts, "workspace_host": workspace_host,
               "admin_token": secrets.token_hex(32),
@@ -47,7 +51,6 @@ def initialize(root, workspace, backend_name="local", hosts=None, workspace_host
         raise TriadError("Workspace does not exist on its configured host")
     atomic_json(root / "config.json", config)
     if os.name != "nt":
-        root.chmod(0o700)
         (root / "config.json").chmod(0o600)
     store = Store(root)
     with store.db:
@@ -220,10 +223,12 @@ class Core:
         if role not in ROLES or (who[0] == "supervisor" and role != "worker"):
             raise TriadError("Supervisor may start only Worker; roles are supervisor and worker")
         old = self.store.get("sessions", role)
-        if old and old["state"] not in {"stopped", "exited"}:
+        if old and old["state"] not in {"stopped", "exited"} and not old.get("start_error"):
             raise TriadError("Session already exists; use replacement for a new generation")
-        if old and old["state"] == "exited":
-            self.stop_role(role)  # An exited group leader is not proof its descendants stopped.
+        if old and old["state"] != "stopped":
+            # An exited group leader is not proof its descendants stopped, and a failed start
+            # may still have spawned. Confirm termination before another generation.
+            self.stop_role(role)
         if self.store.meta("job")["state"] == "stopped":
             raise TriadError("Resume the job before starting sessions")
         self.storage_check(3 * self.config["log_bytes"])
@@ -240,6 +245,8 @@ class Core:
         if not isinstance(profile.get("argv"), list) or not profile["argv"] or not all(isinstance(x, str) for x in profile["argv"]):
             raise TriadError("Profile requires an executable argument vector")
         backend_name = data.get("backend", self.config["backend"])
+        if backend_name not in BACKENDS:
+            raise TriadError(f"Unknown backend: {backend_name}")
         if backend_name == "local" and profile["mode"] == "cooperative":
             raise TriadError("Interactive cooperative profiles require psmux/tmux/tsmux")
         host_name = data.get("host", self.config.get("workspace_host", "local"))
@@ -251,6 +258,8 @@ class Core:
             raise TriadError("Session needs an existing workspace on its selected host")
         if role == "worker" and (host_name != self.config.get("workspace_host", "local") or workspace != self.config["workspace"]):
             raise TriadError("Worker must use the job's canonical workspace host/path; repository migration must be explicit")
+        # A spawn that cannot happen must not reserve (and spend) a generation.
+        connection.check_backend(backend_name)
         generation = (old or {}).get("generation", 0) + 1
         session_dir = self.root / "sessions" / f"{role}-g{generation}"
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -295,8 +304,9 @@ class Core:
             spec = connection.prepare(spec, bootstrap_text, recovery)
             atomic_json(Path(session["spec"]), spec)
             transport = connection.session("start", session)
-        except Exception:
-            session["state"] = "unknown"
+        except Exception as exc:
+            # A later start confirms this generation stopped, then replaces it.
+            session.update(state="unknown", start_error=f"{type(exc).__name__}: {exc}"[:1000])
             self.store.put("sessions", session)
             self.store.db.commit()
             raise
@@ -310,6 +320,7 @@ class Core:
             raise TriadError("Heartbeat requires a session credential")
         session = self.session(who[0])
         session["heartbeat"] = now()
+        session.pop("start_error", None)  # A live host proves the start succeeded after all.
         if session["state"] in {"starting", "unknown"}:
             session["state"] = "alive"
         self.store.put("sessions", session)
@@ -323,7 +334,7 @@ class Core:
             "SELECT id FROM messages WHERE recipient=? AND generation=? AND state='submitted'",
             who).fetchone()
         if outstanding:
-            raise TriadError("Acknowledge the submitted message before declaring ready")
+            raise TriadError(f"Acknowledge submitted message {outstanding['id']} before declaring ready")
         if who[0] == "worker" and any(r["state"] in {"running", "unknown"} for r in self.store.all("runs")):
             raise TriadError("A verification command is still running")
         session.update(state="alive", turn="ready", heartbeat=now())
@@ -338,7 +349,16 @@ class Core:
             raise TriadError("Inbox requires a session credential")
         session = self.session(who[0])
         job = self.store.meta("job")
-        if (job["state"] == "stopped" or (who[0] == "worker" and job["state"] != "running")
+        if job["state"] == "stopped":
+            return None
+        if data.get("redeliver"):
+            # A reply lost after submission stays recoverable: this is not a new dispatch.
+            row = self.store.db.execute(
+                "SELECT data FROM messages WHERE recipient=? AND generation=? AND state='submitted' ORDER BY created,rowid LIMIT 1",
+                who).fetchone()
+            if row:
+                return json.loads(row["data"]) | {"redelivered": True}
+        if ((who[0] == "worker" and job["state"] != "running")
                 or job.get("takeover") == who[0] or session["turn"] != "ready"):
             return None
         row = self.store.db.execute(
@@ -479,10 +499,18 @@ class Core:
         return task
 
     def do_correct(self, who, data):
+        if self.store.meta("job")["state"] != "running":
+            raise TriadError("Job is paused or stopped")
         task = self.task(data["task"])
         session = self.session("worker")
-        if task.get("generation") != session["generation"] or task["state"] == "accepted":
+        if (session["state"] in {"stopped", "exited"} or task.get("generation") != session["generation"]
+                or task["state"] not in {"assigned", "working", "awaiting_verification", "blocked"}):
             raise TriadError("Cannot correct this task in the current generation")
+        if any(t["id"] != task["id"] and t["state"] in {"assigned", "working", "awaiting_verification"}
+               for t in self.store.all("tasks")):
+            raise TriadError("One active task is allowed; resolve the current task first")
+        if task["design_revision"] != self.store.meta("job")["design"]["revision"]:
+            raise TriadError("Task has an old design revision; create a revised task")
         task.update(state="working", result=None)
         self.store.put("tasks", task)
         return self.store.enqueue("worker", session["generation"], "correct",
@@ -509,10 +537,15 @@ class Core:
         self.store.event("session_stopped", {"role": role, "generation": session["generation"]})
         return session
 
+    def refuse_during_takeover(self, who):
+        if who[0] == "supervisor" and self.store.meta("job").get("takeover"):
+            raise TriadError("A human has taken over a session; wait for the Designer to resume")
+
     def do_interrupt(self, who, data):
         role = data.get("role", "worker")
         if who[0] == "supervisor" and role != "worker":
             raise TriadError("Supervisor can interrupt only Worker")
+        self.refuse_during_takeover(who)
         self.stop_role(role)
         return {"stopped": role, "note": "Portable hard interruption; restart creates a new generation"}
 
@@ -520,6 +553,7 @@ class Core:
         role = data.get("role", "worker")
         if who[0] == "supervisor" and role != "worker":
             raise TriadError("Supervisor can replace only Worker")
+        self.refuse_during_takeover(who)
         old = self.stop_role(role)
         self.store.db.commit()
         return self.do_start(who, {"role": role, "profile": data.get("profile", old["profile"]),
@@ -527,23 +561,30 @@ class Core:
                                   "host": data.get("host", old.get("host", "local")),
                                   "workspace": data.get("workspace", old.get("workspace", self.config["workspace"]))})
 
-    def do_pause(self, who, data):
+    def do_pause(self, who, data, reason=None):
         job = self.store.meta("job")
+        # A later pause never downgrades one that only the Designer may lift.
+        if not (job["state"] == "paused" and job.get("paused_by") in DESIGNER_PAUSES):
+            job["paused_by"] = reason or who[0]
         job["state"] = "paused"
         self.store.set_meta("job", job)
-        self.store.event("paused", {"note": "Dispatch paused; an active bounded task may continue"})
+        self.store.event("paused", {"by": job["paused_by"], "note": "Dispatch paused; an active bounded task may continue"})
         return job
 
     def do_resume(self, who, data):
         job = self.store.meta("job")
+        if who[0] != "designer" and job["state"] != "running" and (
+                job.get("takeover") or job.get("paused_by", "designer") in DESIGNER_PAUSES):
+            raise TriadError("Only the Designer can resume after a Designer pause, takeover or escalation")
         job["state"] = "running"
         job.pop("takeover", None)
+        job.pop("paused_by", None)
         self.store.set_meta("job", job)
         self.store.event("resumed", {})
         return job
 
     def do_escalate(self, who, data):
-        self.do_pause(who, {})
+        self.do_pause(who, {}, reason="escalation")
         self.store.event("escalation", data)
         return {"escalated": True, "details": data}
 
@@ -552,7 +593,7 @@ class Core:
         if session["turn"] != "ready" or any(r["state"] in {"running", "unknown"} for r in self.store.all("runs")):
             raise TriadError("Wait for a ready session and completed commands before takeover")
         command = self.connections.for_session(session).session("attach", session)
-        self.do_pause(who, {})
+        self.do_pause(who, {}, reason="takeover")
         job = self.store.meta("job")
         job["takeover"] = data["role"]
         self.store.set_meta("job", job)
@@ -603,7 +644,7 @@ class Core:
                     task["deadline_reported"] = True
                     self.store.put("tasks", task)
                     self.notify("task_deadline", {"task": task["id"], "timeout": task["timeout"]})
-                    self.do_pause(("designer", 0), {})
+                    self.do_pause(("designer", 0), {}, reason="deadline")
                     # Deadline enforcement is deterministic policy, not a new reasoning role.
                     try:
                         self.stop_role("worker")

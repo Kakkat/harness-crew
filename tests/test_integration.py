@@ -8,10 +8,51 @@ import tempfile
 import time
 import unittest
 
-from triad.backends import ENTRY, alive
+from triad.backends import ENTRY, alive, process_identity
 from triad.client import Client
 from triad.core import initialize
 from triad.util import TriadError, atomic_json, read_json
+
+# Orphans a sleeper in its own session, as a daemonizing tool would, then acts as a Worker.
+ESCAPING_HARNESS = r'''
+import json, os, subprocess, sys, time
+subprocess.run([sys.executable, "-c", "import subprocess, sys; "
+                "p = subprocess.Popen(['sleep', '300'], start_new_session=True); "
+                "open(sys.argv[1], 'w').write(str(p.pid))", sys.argv[1]], check=True)
+if sys.argv[2] == "exit":
+    while not os.path.exists(sys.argv[1] + ".go"):
+        time.sleep(0.05)
+    sys.exit(0)
+print(json.dumps({"type": "action", "id": "ready", "action": "ready", "data": {}}), flush=True)
+for line in sys.stdin:
+    pass
+'''
+
+# Reuses one action ID for everything and records each delivered message type.
+REUSED_ID_HARNESS = r'''
+import json, sys
+def act(action, data=None):
+    print(json.dumps({"type": "action", "id": "same", "action": action, "data": data or {}}), flush=True)
+act("ready")
+with open(sys.argv[1], "a") as record:
+    for line in sys.stdin:
+        value = json.loads(line)
+        if value["type"] == "message":
+            record.write(value["message"]["type"] + "\n")
+            record.flush()
+            act("ack", {"message": value["message"]["id"]})
+            act("ready")
+'''
+
+MULTIPLEXER = "psmux" if os.name == "nt" else "tmux"
+
+MARKING_HARNESS = r'''
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).touch()
+print(json.dumps({"type": "action", "id": "ready", "action": "ready", "data": {}}), flush=True)
+for line in sys.stdin:
+    pass
+'''
 
 
 class IntegrationTests(unittest.TestCase):
@@ -48,6 +89,20 @@ class IntegrationTests(unittest.TestCase):
         result = self.client.call("start", {"role": role, "profile": profile or "demo-" + role})
         self.wait(lambda: any(s["role"] == role and s["turn"] == "ready" for s in self.client.call("status")["sessions"]))
         return result
+
+    def profile(self, name, source, *args):
+        script = self.root / (name + ".py")
+        script.write_text(source)
+        config = read_json(self.state / "config.json")
+        config["profiles"][name] = {"mode": "jsonl", "argv": [sys.executable, str(script), *map(str, args)]}
+        atomic_json(self.state / "config.json", config)
+
+    def escaped_sleeper(self, record):
+        pid = int(self.wait(lambda: record.exists() and record.read_text()))
+        identity = process_identity(pid)
+        self.assertIsNotNone(identity)
+        self.addCleanup(lambda: process_identity(pid) == identity and os.kill(pid, 9))
+        return pid, identity
 
     def task(self, checks=None):
         return self.client.call("create_task", {"objective": "Create greeting", "checks": checks or [{"name": "greeting",
@@ -125,14 +180,54 @@ class IntegrationTests(unittest.TestCase):
         log = self.state / "evidence" / run["id"] / "stdout.log"
         self.assertLessEqual(log.stat().st_size, 1024 * 1024)
 
-    @unittest.skipUnless(os.name == "nt" and shutil.which("psmux"), "Native psmux is not installed")
-    def test_replace_jsonl_worker_with_cooperative_worker_in_psmux(self):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux child subreaper")
+    def test_stopping_worker_kills_descendants_outside_its_process_group(self):
+        record = self.root / "escaped.pid"
+        self.profile("escaping", ESCAPING_HARNESS, record, "stay")
+        self.start("worker", "escaping")
+        pid, identity = self.escaped_sleeper(record)
+        self.client.call("interrupt", {"role": "worker"})
+        self.wait(lambda: process_identity(pid) != identity, timeout=5)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux child subreaper")
+    def test_exiting_harness_leaves_no_adopted_descendants(self):
+        record = self.root / "escaped.pid"
+        self.profile("escaping", ESCAPING_HARNESS, record, "exit")
+        self.client.call("start", {"role": "worker", "profile": "escaping"})
+        pid, identity = self.escaped_sleeper(record)
+        Path(str(record) + ".go").touch()
+        self.wait(lambda: process_identity(pid) != identity, timeout=10)
+
+    def test_jsonl_harness_may_reuse_action_ids(self):
+        record = self.root / "received.log"
+        self.profile("reused", REUSED_ID_HARNESS, record)
+        self.start("worker", "reused")
+        task = self.task()
+        self.client.call("assign", {"task": task["id"]})
+        self.wait(lambda: record.exists() and record.read_text().split() == ["assign"])
+        self.client.call("correct", {"task": task["id"], "instruction": "Check the newline"})
+        self.wait(lambda: record.read_text().split() == ["assign", "correct"])
+
+    def test_host_of_revoked_session_does_not_spawn_harness(self):
+        marker = self.root / "spawned"
+        self.profile("marking", MARKING_HARNESS, marker)
+        session = self.start("worker", "marking")
+        self.client.call("interrupt", {"role": "worker"})
+        marker.unlink()
+        # A host that only starts running after its session was stopped.
+        subprocess.run([sys.executable, str(ENTRY), "host", "--spec", session["spec"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        self.assertFalse(marker.exists())
+        self.assertIn("revoked", (Path(session["spec"]).parent / "output.log").read_text())
+
+    @unittest.skipUnless(shutil.which(MULTIPLEXER), f"{MULTIPLEXER} is not installed")
+    def test_replace_jsonl_worker_with_cooperative_worker_in_multiplexer(self):
         first = self.start("worker")
         config = read_json(self.state / "config.json")
         script = ENTRY.parent / "examples" / "cooperative_worker.py"
         config["profiles"]["cooperative"] = {"mode": "cooperative", "argv": [sys.executable, str(script)]}
         atomic_json(self.state / "config.json", config)
-        replacement = self.client.call("replace", {"role": "worker", "profile": "cooperative", "backend": "psmux"})
+        replacement = self.client.call("replace", {"role": "worker", "profile": "cooperative", "backend": MULTIPLEXER})
         self.wait(lambda: self.client.call("status")["sessions"][0]["turn"] == "ready", timeout=30)
         self.start("supervisor")
         task = self.task()

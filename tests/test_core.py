@@ -1,11 +1,16 @@
 import json
+import os
 from pathlib import Path
 import secrets
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
+from triad.connections import LocalConnection
 from triad.core import Core, initialize
+from triad.server import tick_safely
 from triad.util import CappedLog, FileLock, TriadError, fingerprint, uid
 
 
@@ -208,6 +213,126 @@ class CoreTests(unittest.TestCase):
             self.call("inbox", role="worker")
             self.call("heartbeat", role="worker")
         self.assertEqual(count, self.core.store.db.execute("SELECT count(*) FROM requests").fetchone()[0])
+
+    def test_supervisor_cannot_lift_designer_pause_or_escalation(self):
+        self.call("pause")
+        with self.assertRaisesRegex(TriadError, "Designer"):
+            self.call("resume", role="supervisor")
+        self.call("resume")
+        self.call("pause", role="supervisor")
+        self.call("resume", role="supervisor")  # Its own pause.
+        self.call("escalate", {"reason": "Design conflict"}, role="supervisor")
+        self.call("pause", role="supervisor")  # Must not downgrade the escalation.
+        with self.assertRaisesRegex(TriadError, "Designer"):
+            self.call("resume", role="supervisor")
+        self.call("resume")
+        self.assertEqual(self.core.store.meta("job")["state"], "running")
+
+    def test_supervisor_cannot_override_human_takeover(self):
+        with self.core.store.db:
+            job = self.core.store.meta("job")
+            job.update(state="paused", paused_by="takeover", takeover="worker")
+            self.core.store.set_meta("job", job)
+        for action, data in [("resume", {}), ("interrupt", {"role": "worker"}), ("replace", {"role": "worker"})]:
+            with self.assertRaisesRegex(TriadError, "Designer|human"):
+                self.call(action, data, role="supervisor")
+        self.assertEqual(self.core.session("worker")["state"], "alive")
+
+    def test_correction_cannot_create_second_active_task(self):
+        first = self.assign()
+        self.call("blocked", {"task": first["id"], "reason": "Needs a decision"}, role="worker")
+        self.call("ready", role="worker")
+        second = self.task()
+        self.call("assign", {"task": second["id"]}, role="supervisor")
+        with self.assertRaisesRegex(TriadError, "One active task"):
+            self.call("correct", {"task": first["id"], "instruction": "Retry"}, role="supervisor")
+
+    def test_correction_is_not_dispatched_while_paused(self):
+        task = self.assign()
+        self.call("pause")
+        with self.assertRaisesRegex(TriadError, "paused"):
+            self.call("correct", {"task": task["id"], "instruction": "Retry"}, role="supervisor")
+
+    def test_lost_inbox_reply_can_be_redelivered(self):
+        task = self.task()
+        self.call("assign", {"task": task["id"]}, role="supervisor")
+        lost = self.call("inbox", role="worker")  # The reply never reached the agent.
+        self.assertIsNone(self.call("inbox", role="worker"))
+        with self.assertRaisesRegex(TriadError, lost["id"]):
+            self.call("ready", role="worker")
+        again = self.call("inbox", {"redeliver": True}, role="worker")
+        self.assertEqual((again["id"], again["redelivered"]), (lost["id"], True))
+        self.call("ack", {"message": again["id"]}, role="worker")
+        self.assertIsNone(self.call("inbox", {"redeliver": True}, role="worker"))
+        self.call("ready", role="worker")
+
+    def test_unavailable_backend_does_not_reserve_generation(self):
+        with self.core.store.db:
+            self.core.store.db.execute("DELETE FROM sessions")
+        with patch("triad.backends.shutil.which", return_value=None):
+            with self.assertRaisesRegex(TriadError, "not installed"):
+                self.call("start", {"role": "worker", "profile": "demo-worker", "backend": "tmux"})
+        self.assertIsNone(self.core.store.get("sessions", "worker"))
+        self.assertEqual(self.core.store.meta("session_count", 0), 0)
+
+    def test_failed_start_can_be_retried(self):
+        with self.core.store.db:
+            self.core.store.db.execute("DELETE FROM sessions")
+        real = LocalConnection.session
+
+        def spawning(outcome):
+            def session(connection, operation, record):
+                if operation != "start":
+                    return real(connection, operation, record)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            return session
+
+        with patch.object(LocalConnection, "session", spawning(TriadError("spawn failed"))):
+            with self.assertRaisesRegex(TriadError, "spawn failed"):
+                self.call("start", {"role": "worker", "profile": "demo-worker"})
+        self.assertIn("spawn failed", self.core.session("worker")["start_error"])
+        # The failed generation never recorded a host identity, so it is confirmed stopped.
+        with patch.object(LocalConnection, "session", spawning({"started": True})):
+            retried = self.call("start", {"role": "worker", "profile": "demo-worker"})
+        self.assertEqual(retried["generation"], 2)
+        self.assertNotIn("start_error", self.core.session("worker"))
+
+    def test_maintenance_failure_is_recorded_once(self):
+        with patch.object(self.core, "tick", side_effect=RuntimeError("probe failed")):
+            first = tick_safely(self.core)
+            self.assertEqual(tick_safely(self.core, first), first)
+        errors = [e for e in self.core.store.events() if e["type"] == "controller_error"]
+        self.assertEqual([e["data"]["error"] for e in errors], ["RuntimeError: probe failed"])
+
+    def test_fingerprint_entries_cannot_imitate_each_other(self):
+        one, two = self.root / "one", self.root / "two"
+        one.mkdir()
+        two.mkdir()
+        (one / "a").write_bytes(b"x\0b\0y")
+        (two / "a").write_bytes(b"x")
+        (two / "b").write_bytes(b"y")
+        self.assertNotEqual(fingerprint(one), fingerprint(two))
+
+    @unittest.skipIf(os.name == "nt", "POSIX modes, symlinks and FIFOs")
+    def test_fingerprint_tracks_modes_and_file_types(self):
+        script = self.workspace / "run.sh"
+        script.write_text("echo hi\n")
+        before = fingerprint(self.workspace)
+        script.chmod(0o755)
+        self.assertNotEqual(before, fingerprint(self.workspace))
+        (self.root / "file").mkdir()
+        (self.root / "file" / "l").write_text("link:t")
+        (self.root / "link").mkdir()
+        os.symlink("t", self.root / "link" / "l")
+        self.assertNotEqual(fingerprint(self.root / "file"), fingerprint(self.root / "link"))
+        os.mkfifo(self.workspace / "pipe")
+        measured = []
+        reader = threading.Thread(target=lambda: measured.append(fingerprint(self.workspace)), daemon=True)
+        reader.start()
+        reader.join(timeout=5)
+        self.assertTrue(measured, "fingerprint blocked on a FIFO")
 
 
 if __name__ == "__main__":

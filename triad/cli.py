@@ -209,7 +209,8 @@ def main(argv=None):
             elif command == "inbox":
                 deadline = time.monotonic() + args.timeout
                 while True:
-                    result = client.call("inbox", retries=3)
+                    # Also returns a submitted but unacknowledged message whose reply was lost.
+                    result = client.call("inbox", {"redeliver": True}, retries=3)
                     if result is not None or not args.wait or time.monotonic() >= deadline:
                         break
                     time.sleep(0.5)

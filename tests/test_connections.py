@@ -1,14 +1,19 @@
 import io
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, Mock
 import zipfile
 
-from triad.connections import Connections, SSHConnection, ConnectionUnavailable, runtime_bundle, validate_host
+from triad.backends import process_identity
+from triad.connections import (TUNNEL_HELPER, Connections, SSHConnection, ConnectionUnavailable,
+                               runtime_bundle, validate_host)
 from triad.core import Core, initialize
 from triad.util import TriadError, read_json, atomic_json, uid
 
@@ -92,6 +97,33 @@ class ConnectionTests(unittest.TestCase):
         self.assertIn("-tt", argv)
         self.assertEqual(shlex.split(argv[-1]), ["tmux", "attach-session", "-t", "session x"])
 
+    def test_unprepared_remote_session_has_nothing_to_stop(self):
+        spec = self.root / "spec.json"
+        atomic_json(spec, {"role": "worker"})  # Start failed before prepare returned.
+        with patch.object(self.connection, "call") as call:
+            self.assertIsNone(self.connection.session("stop", {"spec": str(spec), "backend": "tmux"}))
+            call.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "Tunnel helpers run on the Linux end of the tunnel")
+    def test_tunnel_helper_exits_when_its_ssh_session_ends(self):
+        # Stand-in for sshd: start the helper, see it become ready, then disappear.
+        launcher = subprocess.run([sys.executable, "-c",
+            "import subprocess, sys; p = subprocess.Popen([sys.executable, '-u', '-c', sys.argv[1]], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); "
+            "assert p.stdout.readline().strip() == b'TRIAD_TUNNEL_READY'; print(p.pid)", TUNNEL_HELPER],
+            capture_output=True, text=True, timeout=10, check=True)
+        pid = int(launcher.stdout)
+        identity = process_identity(pid)
+        self.assertIsNotNone(identity)  # It polls every two seconds, so it outlives the launcher briefly.
+        deadline = time.monotonic() + 10
+        try:
+            while process_identity(pid) == identity and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertNotEqual(process_identity(pid), identity)
+        finally:
+            if identity and process_identity(pid) == identity:
+                os.kill(pid, 9)
+
 
 class RemoteCoreTests(unittest.TestCase):
     def setUp(self):
@@ -131,6 +163,7 @@ class RemoteCoreTests(unittest.TestCase):
     def test_supervisor_and_worker_can_select_different_hosts(self):
         self.call("design", {"text": "Do the task on the canonical remote repository"})
         with patch.object(SSHConnection, "exists", return_value=True), \
+             patch.object(SSHConnection, "check_backend"), \
              patch.object(SSHConnection, "snapshot", return_value="digest"), \
              patch.object(SSHConnection, "prepare", side_effect=lambda s, b, h: s), \
              patch.object(SSHConnection, "session", return_value={"started": True}):

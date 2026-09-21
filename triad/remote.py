@@ -5,7 +5,7 @@ from pathlib import Path
 import socket
 import sys
 
-from .backends import alive, backend
+from .backends import alive, backend, stop_session
 from .util import TriadError, atomic_json, fingerprint
 
 
@@ -52,7 +52,9 @@ def operation(name, data):
         action = name.removeprefix("session_")
         if action == "alive":
             return alive(Path(data["spec"]).parent)
-        if action not in {"start", "stop", "capture", "attach"}:
+        if action == "stop":
+            return stop_session(data["backend"], data["spec"])
+        if action not in {"start", "capture", "attach"}:
             raise TriadError("Unsupported session operation")
         return getattr(backend(data["backend"]), action)(data["spec"])
     if name == "evidence":

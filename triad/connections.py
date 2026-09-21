@@ -16,8 +16,15 @@ import threading
 import time
 import zipfile
 
-from .backends import ENTRY, alive, backend, process_identity
+from .backends import ENTRY, alive, backend, process_identity, stop_session
 from .util import TriadError, atomic_json, fingerprint, read_json
+
+TUNNEL_MARKER = "TRIAD_TUNNEL_READY"
+# Remote end of a reverse tunnel. It exits once sshd drops the session and it is reparented;
+# sleeping unconditionally would leave one interpreter behind per tunnel.
+# One line, so the command survives any client/shell quoting unchanged.
+TUNNEL_HELPER = (f"import os,time; parent=os.getppid(); print('{TUNNEL_MARKER}',flush=True); "
+                 'exec("while os.getppid()==parent: time.sleep(2)")')
 
 
 class ConnectionUnavailable(TriadError):
@@ -80,11 +87,15 @@ class LocalConnection:
     def prepare(self, spec, bootstrap, handoff):
         return spec
 
+    def check_backend(self, name):
+        backend(name)  # Raises when the multiplexer is not installed on this host.
+
     def session(self, operation, session):
-        transport = backend(session["backend"])
         if operation == "alive":
             return alive(Path(session["spec"]).parent)
-        return getattr(transport, operation)(session["spec"])
+        if operation == "stop":
+            return stop_session(session["backend"], session["spec"])
+        return getattr(backend(session["backend"]), operation)(session["spec"])
 
 
 class SSHConnection(LocalConnection):
@@ -164,9 +175,18 @@ class SSHConnection(LocalConnection):
                               "endpoint": self.manager.tunnel_endpoint(self), "budget": self.manager.config["storage_bytes"]})
         return dict(spec, remote_spec=remote["spec"], remote_state=self.job_root(), runtime=self.runtime)
 
+    def check_backend(self, name):
+        if not self.call("probe", {"backend": name})["backend_executable"]:
+            raise TriadError(f"Session backend is not installed on {self.name}: {name}")
+
     def session(self, operation, session):
         spec = read_json(Path(session["spec"]))
-        remote_spec = spec["remote_spec"]
+        remote_spec = spec.get("remote_spec")
+        if not remote_spec:
+            # Start runs only after prepare returned, so an unprepared session never ran remotely.
+            if operation in {"stop", "alive"}:
+                return None
+            raise TriadError(f"Session was never prepared on {self.name}")
         if operation == "attach":
             argv = self.call("session_attach", {"backend": session["backend"], "spec": remote_spec})
             return [*self.ssh_argv(tty=True), shlex.join(argv)]
@@ -228,11 +248,10 @@ class Connections:
         remote_port = current.get("remote_port") or connection.config.get("reverse_port")
         if not remote_port:
             remote_port = connection.call("free_port", {})
-        marker = "TRIAD_TUNNEL_READY"
-        script = f"import time; print('{marker}',flush=True); time.sleep(31536000)"
+        # exec keeps the helper a direct child of sshd, whatever the remote login shell is.
         argv = [*connection.ssh_argv(extra=("-o", "ExitOnForwardFailure=yes", "-R",
                     f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}")),
-                shlex.join([connection.python, "-u", "-c", script])]
+                "exec " + shlex.join([connection.python, "-u", "-c", TUNNEL_HELPER])]
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         self.tunnels[connection.name] = process
@@ -240,7 +259,7 @@ class Connections:
         threading.Thread(target=lambda: ready.put(process.stdout.readline(256)), daemon=True).start()
         try:
             line = ready.get(timeout=15)
-            if line.strip() != marker.encode():
+            if line.strip() != TUNNEL_MARKER.encode():
                 raise ConnectionUnavailable(f"SSH tunnel for {connection.name} failed to establish forwarding")
         except queue.Empty as exc:
             process.kill()

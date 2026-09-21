@@ -70,8 +70,8 @@ triad --state PATH down
 Use `python -m triad` in place of `triad` without installation.
 
 - `observe` is read-only: terminal snapshot or bounded captured output.
-- `attach` is interactive takeover: requires a ready role with no unresolved checks; pauses dispatch before launching the multiplexer client. Resume explicitly after reconciling human edits.
-- `pause` stops new Worker dispatch. Already running bounded work may continue; Supervisor can still receive feedback. Interactive takeover also pauses the selected role's inbox.
+- `attach` is interactive takeover: requires a ready role with no unresolved checks; pauses dispatch before launching the multiplexer client. Resume explicitly after reconciling human edits; only the Designer can resume a takeover.
+- `pause` stops new Worker dispatch. Already running bounded work may continue; Supervisor can still receive feedback. Interactive takeover also pauses the selected role's inbox. The Supervisor may resume its own pauses and task-deadline pauses; a Designer pause, takeover, or escalation needs the Designer's `resume`.
 - `interrupt worker` stops that generation and its ordinary descendants. Portable v1 interruption is termination, not a vendor-specific soft cancel.
 - `replace` confirms termination, preserves files, writes a handoff, revokes old credentials, and creates a new generation. Blocked tasks require an explicit new assignment.
 - `stop` stops both sessions but keeps the controller available for inspection.
@@ -98,7 +98,7 @@ inbox --wait
 ...
 ```
 
-`inbox --wait` is a blocking local poll; it makes no model calls. A Worker performs `check --task TASK_ID --name CHECK_NAME`, fixes failures, and finally calls:
+`inbox --wait` is a blocking local poll; it makes no model calls. If a delivered message's reply is lost, `inbox` returns that unacknowledged message again, marked `redelivered`. A Worker performs `check --task TASK_ID --name CHECK_NAME`, fixes failures, and finally calls:
 
 ```text
 result --task TASK_ID --summary "What changed" --evidence RUN_ID [RUN_ID ...]
@@ -125,7 +125,7 @@ Host -> harness:
 {"type":"message","message":{"v":1,"id":"m-...","seq":12,"to":"worker","generation":1,"type":"assign","body":{"id":"task-..."}}}
 ```
 
-The harness explicitly acknowledges each message, uses role-authorized actions, and emits `ready` after handling it. All CLI actions map to RPC action names with underscores. Errors return `ok:false` and `error`. Native SDK/CLI streams require an adapter bridge that translates their events into this protocol; arbitrary vendor JSON is not automatically compatible.
+The harness explicitly acknowledges each message, uses role-authorized actions, and emits `ready` after handling it. An action `id` only correlates its `action_result`; the host adds its own idempotency ID, so harness IDs need not be unique. All CLI actions map to RPC action names with underscores. Errors return `ok:false` and `error`. Native SDK/CLI streams require an adapter bridge that translates their events into this protocol; arbitrary vendor JSON is not automatically compatible.
 
 `triad/adapters.py` owns harness framing/capabilities. `triad/backends.py` owns local/psmux/tmux/tsmux process transport. No provider-specific branch exists in the controller. The demo harness is a small reference implementation of the role behavior; `examples/structured_echo.py` illustrates action framing.
 
@@ -134,9 +134,9 @@ The harness explicitly acknowledges each message, uses role-authorized actions, 
 - SQLite atomically records task changes and outgoing messages. The controller is its only writer.
 - Requests carry idempotency IDs. An identical retry returns the saved result; changed content under the same ID is rejected.
 - Submitted messages are not blindly replayed. If a client loses a reply, retry the same request ID. A crashed host with uncertain prompt delivery requires replacement/reconciliation.
-- Startup reserves a deterministic generation before spawning. If startup is incomplete, inspect that generation; do not start a competing writer.
+- Startup reserves a deterministic generation before spawning. Each host records its process identity, then confirms its credential with the controller before spawning its harness. If a start fails, run `start` again: the controller first confirms the failed generation has stopped. A host that never recorded an identity never spawned anything. A backend missing on the selected host is rejected before a generation is reserved.
 - Every session has a generation-scoped credential. Replaced Workers cannot submit valid late results.
-- Windows hosts use a Job Object; POSIX hosts use a process group. Only ordinary contained descendants are supported. Do not daemonize or escape the group.
+- Windows hosts use a Job Object; POSIX hosts use a process group. On Linux the host is also a child subreaper, so orphaned descendants, including ones that call `setsid()`, stay in its tree and are stopped with the session. Processes started through another service manager (for example `systemd-run` or a remote daemon) are not contained.
 - A workspace lock plus durable owner reference prevents a second state directory from taking over a workspace with unreconciled sessions.
 - A handoff stores design, tasks, checks, runs, and the current content fingerprint. Native model context is optional and not yet resumed automatically.
 - Task deadlines default to one hour; named check deadlines default to five minutes. A task deadline pauses the job and attempts to stop its Worker. A five-minute progress gap creates a review event, not a success/failure judgment.
@@ -154,7 +154,7 @@ A Worker result is only a candidate. Acceptance requires:
 5. No reported open issues remain.
 6. Supervisor explicitly accepts.
 
-Fingerprints include untracked files and symlink targets, without following symlinks. `.git` and `__pycache__` are excluded. `config.json` allows additional excluded directory names; configure them narrowly. Large dependency trees can make fingerprinting slow. Verification commands that intentionally alter tracked/source files invalidate their own check: run generators/build preparation first, then use stable checks.
+Fingerprints include untracked files, executable bits, and symlink targets, without following symlinks. FIFOs, sockets, and devices are recorded by type and never opened. `.git` and `__pycache__` are excluded. `config.json` allows additional excluded directory names; configure them narrowly. Large dependency trees can make fingerprinting slow. Verification commands that intentionally alter tracked/source files invalidate their own check: run generators/build preparation first, then use stable checks.
 
 Evidence contains exact command arguments, cwd, timestamps, exit code, timeout/truncation flags, fingerprints, and bounded stdout/stderr. Toolchain/environment immutability is not enforced in v1; use pinned dependencies and a controlled environment for stronger reproducibility. Worker reports and local artifacts are not resistant to deliberate tampering by the same OS account.
 
@@ -186,8 +186,8 @@ These caps cover **Triad-owned files only**. AI harness history, model downloads
 python -m unittest discover -s tests -v
 ```
 
-The automated tests cover authorization, stale generations, request deduplication, ambiguous delivery, persistence, exclusive ownership, changed source evidence, running/failed checks, bounded logs, controller crash/reconnect, reusable sessions, takeover, Worker replacement, command timeouts, and SSH host routing. They include switching a live job from a structured Worker to a cooperative Worker in native Windows psmux without changing Supervisor logic. The complete two-session demo has also been exercised against psmux.
+The automated tests cover authorization, stale generations, request deduplication, ambiguous delivery, persistence, exclusive ownership, changed source evidence, running/failed checks, bounded logs, controller crash/reconnect, reusable sessions, takeover, Worker replacement, command timeouts, SSH host routing, pause authority, failed-start recovery, recycled PIDs, lost-reply redelivery, and (on Linux) descendants that leave the process group. They include switching a live job from a structured Worker to a cooperative Worker in the native multiplexer (psmux on Windows, tmux elsewhere) without changing Supervisor logic. The complete two-session demo has also been exercised against psmux.
 
-V1 has one controller / one job / one Worker, with independent local or SSH host selection for Supervisor and Worker. Linux process paths, SSH tunnels, and the tmux/tsmux backend are implemented but need live platform acceptance testing on those hosts. Multiple Workers, automatic Git integration or repository migration, adversarial sandboxing, native provider context resume, and provider billing telemetry are intentionally not claimed.
+V1 has one controller / one job / one Worker, with independent local or SSH host selection for Supervisor and Worker. Linux process paths, the tmux backend, and SSH tunnels have been exercised live on Linux, with SSH over loopback (see VALIDATION.md); tsmux and SSH between separate machines still need live acceptance testing. Multiple Workers, automatic Git integration or repository migration, adversarial sandboxing, native provider context resume, and provider billing telemetry are intentionally not claimed.
 
 The implementation is small enough to inspect manually: `core.py` owns decisions and state transitions, `store.py` persistence, `server.py` local transport, `runtime.py` session hosts/check execution, and `cli.py` the user interface.

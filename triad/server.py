@@ -4,10 +4,27 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import time
 
 from .core import Core
 from .util import FileLock, TriadError, atomic_json
+
+
+def tick_safely(core, last_error=None):
+    """Run policy maintenance. A failure is recorded once and never stops the control API."""
+    try:
+        core.tick()
+        return None
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:2000]
+        if message != last_error:
+            try:
+                with core.store.db:
+                    core.store.event("controller_error", {"error": message})
+            except sqlite3.Error:
+                pass
+        return message
 
 
 def serve(root, port=0):
@@ -29,7 +46,9 @@ def serve(root, port=0):
                 if previous_root != root:
                     specs = list((previous_root / "sessions").glob("*/spec.json"))
                     if not previous_root.exists() or any(alive(s.parent) is not False for s in specs):
-                        raise TriadError("Workspace has an unreconciled owner in another state directory")
+                        raise TriadError(
+                            f"Workspace has an unreconciled owner in another state directory ({previous_root}). "
+                            f"Stop its sessions there; if that state is gone and nothing runs, delete {ownership}")
             atomic_json(ownership, {"state": str(root)})
             with core.store.db:
                 core.store.set_meta("shutdown", False)
@@ -51,7 +70,8 @@ def serve(root, port=0):
                         token = self.headers.get("Authorization", "").removeprefix("Bearer ")
                         result = {"ok": True, "result": core.rpc(token, request)}
                         status = 200
-                    except (TriadError, ValueError, KeyError, TypeError, OSError, sqlite3.Error) as exc:
+                    except (TriadError, ValueError, KeyError, TypeError, OSError, sqlite3.Error,
+                            subprocess.SubprocessError) as exc:
                         result, status = {"ok": False, "error": str(exc)}, 400
                     body = json.dumps(result).encode()
                     self.send_response(status)
@@ -72,13 +92,14 @@ def serve(root, port=0):
             atomic_json(root / "endpoint.json", {"url": f"http://127.0.0.1:{server.server_port}"})
             print(f"Triad controller: http://127.0.0.1:{server.server_port}  state={root}", flush=True)
             last_tick = 0
+            tick_error = None
             try:
                 while True:
                     server.handle_request()
                     if core.store.meta("shutdown", False):
                         break
                     if time.monotonic() - last_tick > 2:
-                        core.tick()
+                        tick_error = tick_safely(core, tick_error)
                         last_tick = time.monotonic()
             except KeyboardInterrupt:
                 pass  # Deliberately detach controller; explicit 'stop' owns session shutdown.

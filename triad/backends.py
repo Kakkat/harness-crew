@@ -14,6 +14,7 @@ import time
 from .util import TriadError, read_json
 
 ENTRY = Path(__file__).resolve().parents[1] / "triad_entry.py"
+BACKENDS = ("local", "psmux", "tmux", "tsmux")
 
 
 def process_identity(pid):
@@ -60,63 +61,122 @@ def alive(root):
 
 def stop_host(root, timeout=10):
     root = Path(root)
-    if os.name != "nt":
-        path = root / "host.json"
-        if not path.exists():
-            raise TriadError("No host identity; reconcile startup before replacing")
-        data = read_json(path)
-        current = process_identity(data["pid"])
-        if current is not None and current != data["identity"]:
-            raise TriadError("Host PID was recycled; refusing to signal an uncertain process group")
-        if not data.get("contained"):
-            raise TriadError("Host did not confirm process containment")
-        # Also handles a dead group leader with surviving descendants.
-        try:
-            os.killpg(data["pid"], signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        deadline = time.monotonic() + timeout
-        while posix_group_alive(data["pid"]) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if posix_group_alive(data["pid"]):
-            raise TriadError("Owned process group did not terminate; workspace remains blocked")
+    path = root / "host.json"
+    if not path.exists():
+        # A host records its identity before its startup handshake and spawns nothing earlier.
+        # A host that starts after its session was revoked exits at that handshake.
         return
-    if alive(root):
-        data = read_json(root / "host.json")
-        # A stopped host's Windows job or POSIX group owns all ordinary descendants.
-        if not data.get("contained"):
-            raise TriadError("Host did not confirm process containment; refusing automatic replacement")
-        if os.name == "nt":
+    data = read_json(path)
+    if not data.get("identity"):
+        raise TriadError("Host identity is unknown; reconcile its processes before replacing")
+    current = process_identity(data["pid"])
+    if current is not None and current != data["identity"]:
+        # The PID names another process now. The kernel never reuses a PID that is still a
+        # process-group ID, so the host and its whole group have already exited.
+        return
+    if current is None:
+        # Exited host. Its Windows Job Object killed any remaining descendants, and a host
+        # that never confirmed containment never spawned a harness.
+        if os.name == "nt" or not data.get("contained"):
+            return
+        # A dead POSIX group leader may still have surviving descendants in its group.
+        return kill_posix_group(data["pid"], timeout)
+    if not data.get("contained"):
+        raise TriadError("Host did not confirm process containment; refusing automatic replacement")
+    if os.name == "nt":
+        # A stopped host's Windows job owns all ordinary descendants.
+        try:
             subprocess.run(["taskkill", "/PID", str(data["pid"]), "/T", "/F"],
                            capture_output=True, timeout=timeout)
-        else:
-            try:
-                os.killpg(data["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise TriadError(f"Could not stop host: {exc}") from exc
         deadline = time.monotonic() + timeout
         while alive(root) and time.monotonic() < deadline:
             time.sleep(0.1)
-        if alive(root) and os.name != "nt":
-            os.killpg(data["pid"], signal.SIGKILL)
-            time.sleep(0.2)
-        # The group leader may have died before a descendant ignoring SIGTERM.
-        # Confirm/kill the owned group as well before permitting a replacement.
-        if os.name != "nt":
-            try:
-                os.killpg(data["pid"], signal.SIGKILL)
-            except ProcessLookupError:
-                pass
         if alive(root):
             raise TriadError("Could not confirm host termination; workspace remains blocked")
-    elif alive(root) is None:
-        raise TriadError("No host identity; reconcile startup before stopping or replacing")
+        return
+    # Stop the host first. As child subreaper it keeps orphaned descendants in its tree,
+    # including ones that left its process group with setsid().
+    kill_posix_group(data["pid"], timeout, kill_posix_tree(data["pid"]))
+
+
+def kill_posix_group(pgid, timeout, owned=None):
+    """SIGKILL a process group, then confirm it and any separately signalled processes are gone."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+    def survivors():
+        return posix_group_alive(pgid) or any(
+            identity is not None and process_identity(pid) == identity for pid, identity in (owned or {}).items())
+
+    deadline = time.monotonic() + timeout
+    while survivors() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if survivors():
+        raise TriadError("Owned process group did not terminate; workspace remains blocked")
+
+
+def kill_posix_tree(pid, include_root=True):
+    """SIGKILL a process subtree and return {pid: identity} of what was signalled.
+
+    Members are stopped before each new listing, so none can fork or reparent unseen."""
+    owned = {}
+    if include_root:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return owned
+        owned[pid] = process_identity(pid)
+    for _ in range(50):
+        children = {}
+        for row in posix_processes("pid=,ppid="):
+            children.setdefault(int(row[1]), []).append(int(row[0]))
+        tree, found = [pid], False
+        for parent in tree:
+            for child in children.get(parent, ()):
+                if child in tree:
+                    continue
+                tree.append(child)
+                if child not in owned:
+                    try:
+                        os.kill(child, signal.SIGSTOP)
+                    except ProcessLookupError:
+                        continue
+                    owned[child] = process_identity(child)
+                    found = True
+        if not found:
+            break
+    for process in reversed(list(owned)):
+        try:
+            os.kill(process, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return owned
+
+
+def posix_processes(fields):
+    try:
+        result = subprocess.run(["ps", "-e", "-o", fields], capture_output=True, text=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TriadError(f"Cannot list processes to confirm containment: {exc}") from exc
+    return [line.split() for line in result.stdout.splitlines() if line.strip()]
 
 
 def posix_group_alive(pgid):
-    result = subprocess.run(["ps", "-e", "-o", "pgid=,stat="], capture_output=True, text=True, check=True)
-    return any(int(parts[0]) == pgid and not parts[1].startswith("Z")
-               for line in result.stdout.splitlines() if len(parts := line.split()) == 2)
+    return any(len(row) == 2 and int(row[0]) == pgid and not row[1].startswith("Z")
+               for row in posix_processes("pgid=,stat="))
+
+
+def stop_session(name, spec):
+    """Stop through the session's backend, or by host identity when that backend is unavailable."""
+    try:
+        transport = backend(name)
+    except TriadError:
+        return stop_host(Path(spec).parent)
+    return transport.stop(spec)
 
 
 class LocalBackend:
@@ -153,7 +213,10 @@ class MuxBackend(LocalBackend):
             raise TriadError(f"Session backend is not installed: {executable}")
 
     def command(self, *args, check=True):
-        p = subprocess.run([self.executable, *args], capture_output=True, text=True, timeout=20)
+        try:
+            p = subprocess.run([self.executable, *args], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise TriadError(f"Multiplexer command failed: {exc}") from exc
         if check and p.returncode:
             raise TriadError(p.stderr.strip() or p.stdout.strip() or "Multiplexer command failed")
         return p
@@ -166,8 +229,9 @@ class MuxBackend(LocalBackend):
         argv = [sys.executable, "-B", str(ENTRY), "host", "--spec", str(spec)]
         if os.name == "nt":
             script = Path(spec).with_suffix(".ps1")
+            # The BOM makes Windows PowerShell 5.1 read non-ASCII paths as UTF-8, not the ANSI code page.
             script.write_text("& " + " ".join("'" + a.replace("'", "''") + "'" for a in argv) + "\n",
-                              encoding="utf-8")
+                              encoding="utf-8-sig")
             command = subprocess.list2cmdline(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                               "-File", str(script)])
         else:
@@ -194,6 +258,6 @@ class MuxBackend(LocalBackend):
 def backend(name):
     if name == "local":
         return LocalBackend()
-    if name in {"psmux", "tmux", "tsmux"}:
+    if name in BACKENDS:
         return MuxBackend(name)
     raise TriadError(f"Unknown backend: {name}")

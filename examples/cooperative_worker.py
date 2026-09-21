@@ -13,7 +13,7 @@ client = Client()
 client.call("ready", retries=3)
 while True:
     try:
-        message = client.call("inbox", retries=3)
+        message = client.call("inbox", {"redeliver": True}, retries=3)
     except TriadError:
         time.sleep(0.5)
         continue

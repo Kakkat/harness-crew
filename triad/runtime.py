@@ -7,10 +7,11 @@ from pathlib import Path
 import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 
-from .backends import process_identity
+from .backends import kill_posix_tree, process_identity
 from .adapters import adapter
 from .client import Client
 from .util import CappedLog, FileLock, TriadError, atomic_json, now, read_json, uid
@@ -21,6 +22,13 @@ def contain_host():
     if os.name != "nt":
         if os.getpgrp() != os.getpid():
             os.setsid()
+        if sys.platform.startswith("linux"):
+            # Orphaned descendants, including ones that call setsid(), are reparented to this
+            # host instead of init, so stopping the host can still find them in its tree.
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(ctypes.c_int(36), ctypes.c_ulong(1), ctypes.c_ulong(0),  # PR_SET_CHILD_SUBREAPER
+                          ctypes.c_ulong(0), ctypes.c_ulong(0)) != 0:
+                raise TriadError(f"Cannot adopt orphaned descendants: {os.strerror(ctypes.get_errno())}")
         return None
     from ctypes import wintypes
 
@@ -57,6 +65,18 @@ def contain_host():
     return handle
 
 
+def reap_adopted(harness_pid):
+    """Collect exited orphans adopted as subreaper; leave the harness's own status to Popen."""
+    while True:
+        try:
+            info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return
+        if info is None or info.si_pid == harness_pid:
+            return
+        os.waitpid(info.si_pid, 0)
+
+
 def host(spec_path):
     spec_path = Path(spec_path).resolve()
     spec = read_json(spec_path)
@@ -78,11 +98,18 @@ def host(spec_path):
             # Held by the session host, not by the SSH connection or controller.
             writer_lock = FileLock(workspace.parent / (".triad-writer-" + suffix + ".lock")).acquire()
         atomic_json(root / "host.json", metadata)
+        client = Client(spec["state_dir"], spec["token"])
+        # Startup handshake. A session revoked before this host recorded its identity was
+        # stopped without a signal, so this host must not spawn its harness now.
+        try:
+            client.call("heartbeat", retries=2)
+        except TriadError as exc:
+            if not str(exc).startswith("Controller unavailable"):
+                raise
         env = os.environ.copy()
         env.update(TRIAD_STATE=spec["state_dir"], TRIAD_TOKEN=spec["token"],
                    TRIAD_ROLE=spec["role"], TRIAD_GENERATION=str(spec["generation"]),
                    PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
-        client = Client(spec["state_dir"], spec["token"])
         harness = adapter(spec["mode"])
         structured = harness.capabilities.structured_stdio
         proc = subprocess.Popen(spec["argv"], cwd=spec["workspace"], env=env,
@@ -116,13 +143,17 @@ def host(spec_path):
             threading.Thread(target=stderr_reader, daemon=True).start()
         next_poll, next_heartbeat = 0, 0
         pending = None
+        pending_request = None
         inbox_request = None
+        subreaper = sys.platform.startswith("linux")
 
         def send(value):
             proc.stdin.write(harness.encode_message(value))
             proc.stdin.flush()
 
         while proc.poll() is None:
+            if subreaper:
+                reap_adopted(proc.pid)
             clock = time.monotonic()
             if clock >= next_heartbeat:
                 try:
@@ -135,6 +166,9 @@ def host(spec_path):
                     try:
                         pending = output.get_nowait()
                         pending.setdefault("id", uid("adapter"))
+                        # The harness ID only correlates the reply. The host owns idempotency, so a
+                        # reused harness ID can never replay an earlier action's saved result.
+                        pending_request = f"{spec['role']}-{spec['generation']}-{uid('action')}"
                     except queue.Empty:
                         pass
                 if pending:
@@ -144,7 +178,7 @@ def host(spec_path):
                         raise TriadError("JSONL stdout requires type=action; write diagnostics to stderr")
                     try:
                         result = client.call(pending["action"], pending.get("data", {}),
-                                             request_id=f"{spec['role']}-{spec['generation']}-{pending['id']}")
+                                             request_id=pending_request)
                     except TriadError as exc:
                         if str(exc).startswith("Controller unavailable"):
                             time.sleep(0.5)
@@ -181,9 +215,13 @@ def host(spec_path):
         log.close()
         lock.close()
         if os.name != "nt" and metadata["contained"]:
-            # This host is leaving; no background writer may outlive its session.
-            # Include ourselves so even descendants ignoring SIGTERM cannot survive.
-            os.killpg(os.getpgrp(), signal.SIGKILL)
+            # This host is leaving; no background writer may outlive its session. Adopted
+            # orphans outside the group go first, then the group, including ourselves, so even
+            # descendants ignoring SIGTERM cannot survive.
+            try:
+                kill_posix_tree(os.getpid(), include_root=False)
+            finally:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
         # Windows closes the job handle on process exit, killing all remaining descendants.
 
 
@@ -239,27 +277,3 @@ def run_check(client, task_id, name):
               "truncated": any(log.truncated for log in logs), "quiescent": quiescent}
     atomic_json(root / "completion.json", record)
     return client.call("run_finish", record, retries=5)
-
-
-def kill_posix_tree(pid):
-    """Stop an ordinary command subtree without removing it from the host group."""
-    try:
-        os.kill(pid, signal.SIGSTOP)
-    except ProcessLookupError:
-        return
-    listing = subprocess.run(["ps", "-e", "-o", "pid=,ppid="], capture_output=True, text=True, check=True)
-    parents = [tuple(map(int, line.split())) for line in listing.stdout.splitlines() if line.strip()]
-    owned = [pid]
-    for parent in owned:
-        for child, ppid in parents:
-            if ppid == parent and child not in owned:
-                owned.append(child)
-                try:
-                    os.kill(child, signal.SIGSTOP)
-                except ProcessLookupError:
-                    pass
-    for process in reversed(owned):
-        try:
-            os.kill(process, signal.SIGKILL)
-        except ProcessLookupError:
-            pass

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import time
 import uuid
 
@@ -40,20 +41,35 @@ def read_json(path: Path):
 def fingerprint(workspace: str | Path, excludes=()):
     """Content fingerprint, including untracked files. Never follow symlinks."""
     root = Path(workspace).resolve()
-    digest = hashlib.sha256()
     ignored = {".git", "__pycache__", *excludes}
+    for _ in range(3):
+        try:
+            return _fingerprint(root, ignored)
+        except FileNotFoundError:
+            continue  # An entry vanished mid-walk; the tree was changing, so measure it again.
+    raise TriadError("Workspace kept changing while it was fingerprinted")
+
+
+def _fingerprint(root, ignored):
+    digest = hashlib.sha256()
     for directory, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in ignored)
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
             p = Path(directory) / name
-            digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            if p.is_symlink():
-                digest.update(b"link:" + os.readlink(p).encode("utf-8"))
-            else:
+            info = p.lstat()
+            digest.update(os.fsencode(p.relative_to(root).as_posix()) + b"\0")
+            # Each entry is a type tag plus NUL-free or fixed-size data, so contents cannot
+            # imitate other entries. The executable bit is tracked, as Git does.
+            if stat.S_ISLNK(info.st_mode):
+                digest.update(b"L" + os.fsencode(os.readlink(p)) + b"\0")
+            elif stat.S_ISREG(info.st_mode):
+                content = hashlib.sha256()
                 with p.open("rb") as stream:
                     while chunk := stream.read(1024 * 1024):
-                        digest.update(chunk)
-            digest.update(b"\0")
+                        content.update(chunk)
+                digest.update((b"X" if info.st_mode & 0o111 else b"F") + content.digest())
+            else:
+                digest.update(b"S")  # FIFO, socket or device: never opened (a FIFO would block).
     return digest.hexdigest()
 
 

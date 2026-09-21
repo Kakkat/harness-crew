@@ -43,6 +43,7 @@ Requirements:
 - Python 3.11+ and the selected multiplexer installed on each Linux host.
 - Existing repository/working directories and installed, authenticated harness commands on their selected hosts.
 - SSH server permits remote TCP forwarding. Triad requests a loopback-only reverse listener; no public HTTP listener is needed.
+- Other local accounts on each Linux host are trusted. The reverse listener is a loopback TCP port, so while a tunnel is down another local account could bind that port and receive remote sessions' requests, including their session credentials.
 - Do not configure the SSH server to force remote forwards to public interfaces. Triad's control API still requires role credentials, but its intended network boundary is loopback plus SSH.
 
 The remote `root` must be an absolute dedicated directory, not `~`, `/`, or a relative path. SSH authentication is delegated to OpenSSH/ssh-agent/config; no passwords or private key contents are stored in Triad's database.
@@ -83,7 +84,7 @@ Remote session hosts run inside the chosen multiplexer, independently of the SSH
 
 Triad reconnects failed tunnels with bounded delays. The controller reuses its saved local port after restart and can adopt a still-running owned tunnel. Process identity checks guard against confusing a recycled PID with an owned SSH process. Tunnel maintenance runs separately from the request handler.
 
-An unreachable host yields `unknown`/connection errors, never a fabricated `exited` result. Replacement and shutdown require a successful remote stop and confirmation that the owned process group has stopped. If the network is unavailable, the old Worker is not replaced with another writer. Normal descendant processes remain in the session's process group; intentionally escaping containment is unsupported.
+An unreachable host yields `unknown`/connection errors, never a fabricated `exited` result. Replacement and shutdown require a successful remote stop and confirmation that the owned process group has stopped. If the network is unavailable, the old Worker is not replaced with another writer. Normal descendant processes remain in the session's process group. The Linux session host is also a child subreaper, so descendants that call `setsid()` stay in its tree and are stopped with it. Escaping through another service manager is unsupported.
 
 The Worker session host holds a filesystem lock on its Linux workspace. The lock stays held across controller/SSH disconnections. Supervisor can move to another configured host through `replace supervisor --host ... --workspace ...`; its new generation receives the durable handoff. Worker replacement can change harness/multiplexer on its canonical host. Moving a repository to a different host is a separate explicit migration, not an automatic side effect of replacing an agent.
 
@@ -123,4 +124,4 @@ Per-log caps and remote state admission checks apply on the execution host. `sto
 
 Automated tests exercise host selection, SSH argument quoting, strict authentication options, network failures, remote path handling, separate Supervisor/Worker hosts, remote snapshots, and refusal to replace an unreachable Worker. Existing real local-process and Windows psmux tests continue to run.
 
-A live SSH/Linux integration run has not been performed in this environment because no target host was supplied or configured. Run `host-check` and the deterministic two-host example on your selected machines before a production job. The reverse tunnel, Linux process containment, and remote multiplexer behavior need that platform validation.
+A live SSH/Linux run has been performed with the controller and the SSH host on the same Linux machine (SSH to `localhost`): reverse tunnel, remote tmux Worker, remote evidence and storage, controller kill and restart with the remote Worker surviving, and clean shutdown (see VALIDATION.md). A Windows controller driving a separate Linux machine has not yet been exercised. Run `host-check` and the deterministic two-host example on your selected machines before a production job.
